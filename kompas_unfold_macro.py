@@ -5,58 +5,160 @@
 """
 
 import os
-import tempfile
+import sys
 
 
 def get_kompas_app():
     """Получение объекта приложения Компас-3D"""
+    print("Пытаемся получить приложение Компас...")
+    
+    # Попытка 1: через встроенный объект Компаса
     try:
-        # Для встроенного Python в Компасе
-        app = GetApplication()
-        return app
+        print("  Попытка 1: ищем Kompas в globals...")
+        kompas = globals().get('Kompas')
+        if kompas:
+            print("  ✓ Найден Kompas через globals()")
+            return kompas
     except Exception as e:
-        print("Ошибка получения приложения: {}".format(str(e)))
-        return None
-
-
-def get_active_document_3d(app):
-    """Получение активного 3D документа"""
+        print("  ✗ Попытка 1 не удалась: {}".format(str(e)))
+    
+    # Попытка 2: через sys.modules
     try:
-        doc_3d = app.ActiveDocument
-        if doc_3d is None:
-            raise RuntimeError("Нет активного 3D документа.")
-        return doc_3d
+        print("  Попытка 2: ищем в sys.modules...")
+        if 'Kompas' in sys.modules:
+            kompas = sys.modules['Kompas']
+            print("  ✓ Найден Kompas в sys.modules")
+            return kompas
+    except Exception as e:
+        print("  ✗ Попытка 2 не удалась: {}".format(str(e)))
+    
+    # Попытка 3: через __main__
+    try:
+        print("  Попытка 3: ищем в __main__...")
+        main = sys.modules.get('__main__')
+        if hasattr(main, 'Kompas'):
+            kompas = getattr(main, 'Kompas')
+            print("  ✓ Найден Kompas в __main__")
+            return kompas
+    except Exception as e:
+        print("  ✗ Попытка 3 не удалась: {}".format(str(e)))
+    
+    # Попытка 4: через встроенный объект приложения
+    try:
+        print("  Попытка 4: ищем Application...")
+        app = globals().get('Application')
+        if app:
+            print("  ✓ Найден Application через globals()")
+            return app
+    except Exception as e:
+        print("  ✗ Попытка 4 не удалась: {}".format(str(e)))
+    
+    # Попытка 5: прямой импорт
+    try:
+        print("  Попытка 5: прямой импорт...")
+        from Kompas import Application
+        print("  ✓ Успешно импортирован Application")
+        return Application
+    except Exception as e:
+        print("  ✗ Попытка 5 не удалась: {}".format(str(e)))
+    
+    print("  ✗ Не удалось получить приложение.")
+    return None
+
+
+def get_active_document(app):
+    """Получение активного документа"""
+    try:
+        print("Получаем активный документ...")
+        
+        # Попытка 1: прямой доступ
+        try:
+            doc = app.ActiveDocument
+            if doc:
+                print("✓ Активный документ получен (способ 1)")
+                return doc
+        except Exception as e:
+            print("  ✗ Способ 1 не удался: {}".format(str(e)))
+        
+        # Попытка 2: через Documents
+        try:
+            docs = app.Documents
+            if docs and docs.Count > 0:
+                doc = docs.Item(0)
+                print("✓ Активный документ получен (способ 2)")
+                return doc
+        except Exception as e:
+            print("  ✗ Способ 2 не удался: {}".format(str(e)))
+        
     except Exception as e:
         print("Ошибка получения документа: {}".format(str(e)))
-        return None
+    
+    return None
 
 
-def get_top_part(doc_3d):
-    """Получение верхней детали документа"""
+def get_top_part(doc):
+    """Получение верхней детали"""
     try:
-        part = doc_3d.TopPart
-        if part is None:
-            raise RuntimeError("Верхняя деталь не найдена.")
-        print("✓ Верхняя деталь получена: {}".format(part.Name))
-        return part
+        print("Получаем верхнюю деталь...")
+        
+        # Попытка 1: прямой доступ
+        try:
+            part = doc.TopPart
+            if part:
+                print("✓ TopPart получена (способ 1)")
+                print("  Имя: {}".format(part.Name))
+                return part
+        except Exception as e:
+            print("  ✗ Способ 1 не удался: {}".format(str(e)))
+        
+        # Попытка 2: через Parts
+        try:
+            parts = doc.Parts
+            if parts and parts.Count > 0:
+                part = parts.Item(0)
+                print("✓ TopPart получена (способ 2)")
+                print("  Имя: {}".format(part.Name))
+                return part
+        except Exception as e:
+            print("  ✗ Способ 2 не удался: {}".format(str(e)))
+        
     except Exception as e:
         print("Ошибка получения верхней детали: {}".format(str(e)))
-        return None
+    
+    return None
 
 
 def is_sheet_metal_part(part):
     """Проверка является ли деталь листовой"""
-    try:
-        # Попытаемся получить контейнер листовой детали
-        sheet_container = part.SheetMetalContainer
-        if sheet_container is not None:
-            print("✓ Деталь является листовой.")
-            return True, sheet_container
-    except Exception:
-        pass
+    print("Проверяем тип детали...")
     
-    print("✗ Деталь твердотельная (не листовая).")
-    return False, None
+    try:
+        # Попытка 1: SheetMetalContainer
+        try:
+            container = part.SheetMetalContainer
+            if container:
+                print("✓ Деталь листовая (SheetMetalContainer)")
+                return True, container
+        except Exception as e:
+            print("  SheetMetalContainer недоступен: {}".format(str(e)))
+        
+        # Попытка 2: проверка типа через свойства
+        try:
+            # Если есть свойство IsSheetMetal
+            is_sheet = part.IsSheetMetal
+            if is_sheet:
+                print("✓ Деталь листовая (IsSheetMetal = True)")
+                return True, part
+        except Exception as e:
+            print("  IsSheetMetal недоступен: {}".format(str(e)))
+        
+        # Если ничего не сработало - твердотельная
+        print("✗ Деталь твердотельная")
+        return False, None
+        
+    except Exception as e:
+        print("Ошибка проверки типа: {}".format(str(e)))
+        return False, None
 
 
 def get_largest_face(part):
@@ -65,14 +167,20 @@ def get_largest_face(part):
     
     try:
         bodies = part.Bodies
-        if bodies.Count == 0:
-            raise RuntimeError("В детали нет тел.")
+        if not bodies or bodies.Count == 0:
+            print("✗ В детали нет тел.")
+            return None
+        
+        print("  Тел найдено: {}".format(bodies.Count))
         
         body = bodies.Item(0)
         faces = body.Faces
         
-        if faces.Count == 0:
-            raise RuntimeError("В теле нет граней.")
+        if not faces or faces.Count == 0:
+            print("✗ В теле нет граней.")
+            return None
+        
+        print("  Граней найдено: {}".format(faces.Count))
         
         max_area = 0
         largest_face = None
@@ -80,101 +188,79 @@ def get_largest_face(part):
         
         # Ищем грань с максимальной площадью
         for i in range(faces.Count):
-            face = faces.Item(i)
             try:
+                face = faces.Item(i)
                 area = face.Area
+                print("    Грань {}: площадь {}".format(i, area))
+                
                 if area > max_area:
                     max_area = area
                     largest_face = face
                     largest_face_index = i
-                    print("  Грань {}: площадь {}".format(i, area))
-            except Exception:
+            except Exception as e:
+                print("    Грань {} — ошибка: {}".format(i, str(e)))
                 continue
         
         if largest_face is None:
             largest_face = faces.Item(0)
             largest_face_index = 0
         
-        print("✓ Найдена самая большая грань: индекс {}, площадь {}".format(
+        print("✓ Самая большая грань: индекс {}, площадь {}".format(
             largest_face_index, max_area))
         return largest_face
         
     except Exception as e:
         print("Ошибка при получении грани: {}".format(str(e)))
+        import traceback
+        traceback.print_exc()
         return None
 
 
-def create_sketch_from_face(part, face):
-    """Создание эскиза из грани"""
-    print("Создаем эскиз из самой большой грани...")
+def export_to_dxf(doc, output_path):
+    """Экспорт документа в DXF"""
+    print("Экспортируем в DXF: {}".format(output_path))
     
     try:
-        # Для листовой детали используем встроенную развертку
-        # Для твердотельной - проецируем самую большую грань
+        # Убедимся, что папка существует
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
-        sketches = part.Sketches
-        if sketches is None:
-            print("Эскизы недоступны.")
-            return None
+        # Попытка 1: SaveAs с форматом DXF
+        try:
+            print("  Попытка 1: SaveAs с форматом DXF...")
+            doc.SaveAs(output_path, 31)  # 31 = DXF
+            print("✓ Файл сохранен через SaveAs")
+            return True
+        except Exception as e:
+            print("  ✗ SaveAs не удалась: {}".format(str(e)))
         
-        print("✓ Получен доступ к эскизам (всего: {})".format(sketches.Count))
+        # Попытка 2: Export
+        try:
+            print("  Попытка 2: Export...")
+            doc.Export(output_path, 31)
+            print("✓ Файл экспортирован через Export")
+            return True
+        except Exception as e:
+            print("  ✗ Export не удалась: {}".format(str(e)))
         
-        # Возвращаем первый эскиз или саму грань
-        if sketches.Count > 0:
-            return sketches.Item(0)
+        # Попытка 3: через StdCmd
+        try:
+            print("  Попытка 3: StdCmd.ExportToDXF...")
+            # Попробуем через команду Компаса
+            app = globals().get('Kompas')
+            if app and hasattr(app, 'StdCmd'):
+                app.StdCmd.ExportToDXF(output_path)
+                print("✓ Файл экспортирован через StdCmd")
+                return True
+        except Exception as e:
+            print("  ✗ StdCmd не удалась: {}".format(str(e)))
         
-        return face
-        
-    except Exception as e:
-        print("Ошибка при создании эскиза: {}".format(str(e)))
-        return None
-
-
-def export_to_dxf(doc_3d, output_path):
-    """Экспорт 3D фрагмента в DXF"""
-    print("Экспортируем в DXF...")
-    
-    try:
-        # Создаем новый фрагмент для экспорта
-        fragment_doc = GetApplication().Documents.CreateDocument(
-            doc3D_object_type,  # 3D документ
-            None  # Без шаблона
-        )
-        
-        if fragment_doc is None:
-            raise RuntimeError("Не удалось создать фрагмент.")
-        
-        # Копируем содержимое в фрагмент
-        # (в зависимости от версии Компаса это может быть разным)
-        
-        print("Фрагмент создан, сохраняем...")
-        
-        # Экспортируем в DXF
-        # Пример пути: C:\temp\unfold.dxf
-        fragment_doc.SaveAs(output_path, 31)  # 31 = DXF формат
-        
-        print("✓ Файл сохранен: {}".format(output_path))
-        
-        fragment_doc.Close(False)
-        return True
+        print("✗ Экспорт не удалась всеми методами.")
+        return False
         
     except Exception as e:
         print("Ошибка при экспорте: {}".format(str(e)))
-        return False
-
-
-def export_sketch_to_dxf(sketch, output_path):
-    """Экспорт эскиза в DXF"""
-    print("Экспортируем эскиз в DXF...")
-    
-    try:
-        # Сохраняем эскиз как DXF
-        sketch.SaveAs(output_path)
-        print("✓ Эскиз экспортирован: {}".format(output_path))
-        return True
-        
-    except Exception as e:
-        print("Ошибка при экспорте эскиза: {}".format(str(e)))
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -191,17 +277,16 @@ def run_macro():
         app = get_kompas_app()
         if app is None:
             raise RuntimeError("Не удалось подключиться к Компас-3D.")
-        print("✓ Компас-3D подключен.")
         print()
 
         # Получаем активный документ
-        doc_3d = get_active_document_3d(app)
-        if doc_3d is None:
+        doc = get_active_document(app)
+        if doc is None:
             raise RuntimeError("Активный документ не найден.")
         print()
 
         # Получаем верхнюю деталь
-        part = get_top_part(doc_3d)
+        part = get_top_part(doc)
         if part is None:
             raise RuntimeError("Верхняя деталь не найдена.")
         print()
@@ -210,46 +295,34 @@ def run_macro():
         is_sheet, sheet_container = is_sheet_metal_part(part)
         print()
 
-        # Готовим развертку
-        unfold_sketch = None
-        
+        # Обработка детали
         if is_sheet:
             print("Обработка листовой детали...")
-            # Для листовой детали пытаемся получить развертку
-            try:
-                unfold_sketch = create_sketch_from_face(part, None)
-            except Exception as e:
-                print("Ошибка обработки листовой детали: {}".format(str(e)))
         else:
             print("Обработка твердотельной детали...")
-            # Для твердотельной детали берем самую большую грань
             largest_face = get_largest_face(part)
-            if largest_face is not None:
-                unfold_sketch = create_sketch_from_face(part, largest_face)
+            if largest_face is None:
+                raise RuntimeError("Не удалось получить самую большую грань.")
         
         print()
 
         # Экспортируем в DXF
         output_dxf = os.path.expanduser("~\\Desktop\\unfold_output.dxf")
         
-        # Убедимся, что папка существует
-        os.makedirs(os.path.dirname(output_dxf), exist_ok=True)
-        
-        success = export_to_dxf(doc_3d, output_dxf)
-        
-        if not success:
-            # Пробуем альтернативный экспорт
-            print("Пробуем альтернативный экспорт...")
-            # doc_3d.SaveAs(output_dxf, 31)
+        success = export_to_dxf(doc, output_dxf)
         
         print()
         print("=" * 70)
-        print("✓ УСПЕШНО ЗАВЕРШЕНО")
-        print("Файл сохранен: {}".format(output_dxf))
+        if success:
+            print("✓ УСПЕШНО ЗАВЕРШЕНО")
+            print("Файл сохранен: {}".format(output_dxf))
+        else:
+            print("✗ ЭКСПОРТ НЕ УДАЛАСЬ")
+            print("Попробуйте экспортировать вручную через меню Компаса.")
         print("=" * 70)
         print()
 
-        return True
+        return success
 
     except Exception as e:
         print()
