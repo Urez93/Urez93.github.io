@@ -60,6 +60,7 @@ CONFIG = {
 
     # Поведение
     "unfold_sheet_metal": True,   # разворачивать листовое тело автоматически
+    "auto_fixed_face": True,      # сама назначать неподвижную грань развёртки
     "probe_on_error": True,       # при сбое печатать дамп API
     "mode": "",                   # "probe" — только диагностика, без экспорта
 }
@@ -473,6 +474,10 @@ def ensure_unfolded(part):
     created = value_of(holder, ["IsCreated"])
     if created is False:
         warn("параметры развёртки в модели не заданы (нет неподвижной грани).")
+        if not (CONFIG["auto_fixed_face"] and set_fixed_face(holder, part)):
+            log("    Задайте параметры развёртки в модели (Листовое тело ->")
+            log("    Параметры развёртки, указать неподвижную грань) — это")
+            log("    делается один раз и сохраняется в детали.")
 
     try:
         apply_unfold(holder, flag, True, part)
@@ -490,6 +495,26 @@ def ensure_unfolded(part):
             warn("не удалось вернуть состояние развёртки: {}".format(exc))
 
     return True, restore
+
+
+def set_fixed_face(holder, part):
+    """
+    Назначает неподвижную грань развёртки, если в модели она не задана.
+    Берётся наибольшая плоская грань — обычно это основание детали.
+    """
+    face, _, _ = find_plate_faces(get_bodies(part))
+    if face is None or face.source is None:
+        return False
+
+    for value in ((face.source,), face.source):
+        try:
+            holder.FixedFaces = value
+        except Exception:
+            continue
+        fetch(holder, ["UpdateParam"])
+        ok("неподвижная грань развёртки назначена автоматически")
+        return True
+    return False
 
 
 def apply_unfold(holder, flag, state, part):
@@ -595,15 +620,21 @@ def get_bodies(part):
     found = []
     keys = set()
 
-    def remember(obj):
-        body = qi(obj, "IBody7", strict=True)
-        if body is None:
+    def remember(item):
+        # OperationResult отдаёт идентификатор тела, а не сам объект.
+        if isinstance(item, bool):
             return
-        key = value_of(body, ["Reference"]) or value_of(body, ["Name"], "")
-        if key in keys:
-            return
-        keys.add(key)
-        found.append(body)
+        if isinstance(item, int):
+            if item in keys:
+                return
+            keys.add(item)
+            try:
+                item = part.GetBodyById(item)
+            except Exception:
+                return
+        body = qi(item, "IBody7")
+        if body is not None and body not in found:
+            found.append(body)
 
     for operation in operations(part):
         _, result = fetch(operation, BODY_RESULT_NAMES)
@@ -840,6 +871,7 @@ class PlanarFace(object):
         self.origin = origin
         self.normal = normal
         self.area = area
+        self.source = None        # исходный IFace, если нужен самому КОМПАСу
 
 
 def fit_plane(points):
@@ -1009,6 +1041,7 @@ def find_plate_faces(bodies):
             except Exception:
                 result = None
             if result is not None and result.area > 0:
+                result.source = face
                 planar.append(result)
 
     log("  граней просмотрено: {}, плоских: {}".format(total_faces, len(planar)))
