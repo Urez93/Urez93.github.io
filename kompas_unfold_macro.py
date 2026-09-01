@@ -94,6 +94,53 @@ def err(msg):
 
 API7_GUID = "{69AC2981-37C0-4379-84FD-5DD2F3C0A520}"
 
+_API7_MODULE = [None]
+
+
+def api7_module():
+    """Сгенерированный модуль API7 (нужен для приведения интерфейсов)."""
+    if _API7_MODULE[0] is None:
+        try:
+            from win32com.client import gencache
+            _API7_MODULE[0] = gencache.EnsureModule(API7_GUID, 0, 1, 0)
+        except Exception:
+            _API7_MODULE[0] = False
+    return _API7_MODULE[0] or None
+
+
+def qi(obj, *names):
+    """
+    Приведение COM-объекта к конкретному интерфейсу API7.
+
+    В API7 свойства возвращают обобщённые интерфейсы: ActiveDocument отдаёт
+    IKompasDocument, у которого нет TopPart. Нужную "грань" объекта получают
+    через QueryInterface — этим и занимается функция. Если привести не
+    удалось, возвращается исходный объект.
+    """
+    if obj is None:
+        return None
+    module = api7_module()
+    if module is None:
+        return obj
+
+    try:
+        import pythoncom
+    except ImportError:
+        return obj
+
+    source = getattr(obj, "_oleobj_", obj)
+    for name in names:
+        interface = getattr(module, name, None)
+        if interface is None:
+            continue
+        try:
+            return interface(
+                source.QueryInterface(interface.CLSID, pythoncom.IID_IDispatch)
+            )
+        except Exception:
+            continue
+    return obj
+
 
 def connect_kompas():
     """
@@ -293,16 +340,20 @@ def get_active_part(application):
         return None, None, None
     ok("файл: {}".format(path))
 
-    part = value_of(document, ["TopPart"])
+    # ActiveDocument отдаёт обобщённый IKompasDocument — приводим к 3D.
+    document_3d = qi(document, "IKompasDocument3D", "IKompasDocument3D1")
+    part = value_of(document_3d, ["TopPart"]) or value_of(document, ["TopPart"])
     if part is None:
-        err("активный документ не является 3D-деталью.")
-        log("    Макрос работает с деталями (.m3d).")
+        err("не удалось получить деталь из активного документа.")
+        log("    Тип документа: {}".format(type(document_3d).__name__))
+        log("    Макрос работает с деталями (.m3d); сборки не поддерживаются.")
         return None, None, None
+    part = qi(part, "IPart7")
 
     name = value_of(part, ["Name"], "")
     marking = value_of(part, ["Marking"], "")
     ok("деталь: '{}' обозначение: '{}'".format(name, marking))
-    return document, part, path
+    return document_3d, part, path
 
 
 def get_article(part, path):
@@ -440,7 +491,7 @@ DEFINITION_NAMES = ["GetDefinition", "Definition"]
 
 def get_bodies(part):
     name, bodies = fetch(part, BODY_NAMES)
-    items = as_list(bodies)
+    items = [qi(item, "IBody7", "IBody") for item in as_list(bodies)]
     if items:
         ok("тел в детали: {} (через '{}')".format(len(items), name))
     return items
@@ -448,20 +499,19 @@ def get_bodies(part):
 
 def get_faces(body):
     _, faces = fetch(body, FACE_NAMES)
-    return as_list(faces)
+    return [qi(item, "IFace", "IFace7") for item in as_list(faces)]
 
 
 def get_edges(face):
     _, edges = fetch(face, EDGE_NAMES)
     items = as_list(edges)
-    if items:
-        return items
-    # API5-подобная схема: сначала определение грани, потом её рёбра.
-    _, definition = fetch(face, DEFINITION_NAMES)
-    if definition is not None:
-        _, edges = fetch(definition, EDGE_NAMES)
-        return as_list(edges)
-    return []
+    if not items:
+        # API5-подобная схема: сначала определение грани, потом её рёбра.
+        _, definition = fetch(face, DEFINITION_NAMES)
+        if definition is not None:
+            _, edges = fetch(definition, EDGE_NAMES)
+            items = as_list(edges)
+    return [qi(item, "IEdge", "IEdge7") for item in items]
 
 
 def curve_of(edge):
@@ -991,18 +1041,45 @@ def write_dxf(path, loops, article):
 # ДИАГНОСТИКА API
 # ============================================================
 
+def list_interfaces():
+    """Интерфейсы API7, доступные в этой сборке КОМПАСа."""
+    module = api7_module()
+    log("\n--- Интерфейсы API7 (геометрия и листовое тело) ---")
+    if module is None:
+        log("    модуль API7 недоступен")
+        return
+    keywords = ("Part", "Body", "Face", "Edge", "Vertex", "Curve",
+                "Sheet", "Unfold", "Document3D", "Loop", "Model")
+    names = sorted(
+        name for name in dir(module)
+        if name.startswith("I") and any(key in name for key in keywords)
+    )
+    for name in names:
+        log("    {}".format(name))
+    if not names:
+        log("    подходящих имён не найдено")
+
+
 def probe(application):
     """Печатает реальный набор членов COM-объектов текущей сборки КОМПАСа."""
     log("\n" + "=" * 70)
     log("ДИАГНОСТИКА API")
     log("=" * 70)
 
-    document, part, path = get_active_part(application)
+    list_interfaces()
+
+    document = value_of(application, ["ActiveDocument"])
+    describe(document, "Активный документ (как вернул ActiveDocument)")
+
+    document_3d = qi(document, "IKompasDocument3D", "IKompasDocument3D1")
+    describe(document_3d, "Документ после приведения к 3D")
+
+    part = value_of(document_3d, ["TopPart"]) or value_of(document, ["TopPart"])
+    part = qi(part, "IPart7")
     if part is None:
+        log("\nДеталь получить не удалось — дальше идти не с чем.")
         return
 
-    describe(application, "IApplication")
-    describe(document, "Документ")
     describe(part, "Деталь (IPart7)")
 
     container_name, container = fetch(part, SHEET_CONTAINER_NAMES)
@@ -1080,7 +1157,22 @@ def export_active_part(application):
             restore()
 
 
-def run_macro():
+def command_line_mode():
+    """Режим из аргументов запуска; во встроенном Python аргументов нет."""
+    try:
+        return sys.argv[1].lower() if len(sys.argv) > 1 else ""
+    except Exception:
+        return ""
+
+
+def probe_api():
+    """Диагностика API. Вызывается из консоли PyScripter: probe_api()"""
+    application, _ = connect_kompas()
+    if application is not None:
+        probe(application)
+
+
+def run_macro(mode=None):
     log("=" * 70)
     log("КОМПАС-3D -> DXF: развёртка для лазерного раскроя")
     log("=" * 70)
@@ -1089,7 +1181,8 @@ def run_macro():
     if application is None:
         return False
 
-    mode = sys.argv[1].lower() if len(sys.argv) > 1 else ""
+    if mode is None:
+        mode = command_line_mode()
     if mode in ("probe", "diag", "-p"):
         probe(application)
         return True
