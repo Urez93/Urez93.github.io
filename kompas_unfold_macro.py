@@ -502,7 +502,8 @@ def set_fixed_face(holder, part):
     Назначает неподвижную грань развёртки, если в модели она не задана.
     Берётся наибольшая плоская грань — обычно это основание детали.
     """
-    face, _, _ = find_plate_faces(collect_faces(get_bodies(part)))
+    face, _, _ = find_plate_faces(collect_faces(get_bodies(part)),
+                                  sheet_thickness(part))
     if face is None or face.source is None:
         return False
 
@@ -853,12 +854,18 @@ def point_tuple(value):
     return tuple(coords)
 
 
-def curve_points(curve, count):
-    """Равномерная выборка точек кривой; None, если API недоступен."""
-    if curve is None:
-        return None
+STATS = {"curve": 0, "ends": 0, "failed": 0, "located": 0}
 
-    bounds = None
+
+def curve_ranges(curve):
+    """
+    Кандидаты на диапазон параметра кривой.
+
+    Угадывать диапазон нельзя: при параметризации 0..2*pi выборка по (0, 1)
+    молча вернёт кусок дуги вместо всей. Поэтому берём то, что отдаёт API, а
+    подстановки проверяем по концам ребра.
+    """
+    ranges = []
     for name in ("GetParamRange", "ParamRange", "GetParamsRange"):
         try:
             raw = getattr(curve, name)
@@ -868,16 +875,16 @@ def curve_points(curve, count):
         if isinstance(bounds, (list, tuple)):
             numbers = [v for v in bounds if isinstance(v, (int, float))]
             if len(numbers) >= 2:
-                bounds = (float(numbers[0]), float(numbers[1]))
-                break
-        bounds = None
-    if bounds is None:
-        bounds = (0.0, 1.0)
+                ranges.append((float(numbers[0]), float(numbers[1])))
+    ranges.append((0.0, 1.0))
+    ranges.append((0.0, 2.0 * math.pi))
+    return ranges
 
-    start, finish = bounds
+
+def sample_range(curve, start, finish, count):
+    """Точки кривой на заданном диапазоне параметра."""
     if abs(finish - start) < 1e-12:
         return None
-
     points = []
     for index in range(count + 1):
         parameter = start + (finish - start) * index / float(count)
@@ -897,6 +904,91 @@ def curve_points(curve, count):
             return None
         points.append(sample)
     return points
+
+
+def mismatch(points, ends):
+    """
+    Насколько выборка расходится с ребром: у обычного ребра концы выборки
+    должны совпасть с его вершинами, у замкнутого — сойтись друг с другом.
+    """
+    if ends and norm(sub(ends[0], ends[1])) > CONFIG["weld_tolerance"]:
+        direct = norm(sub(points[0], ends[0])) + norm(sub(points[-1], ends[1]))
+        reverse = norm(sub(points[0], ends[1])) + norm(sub(points[-1], ends[0]))
+        return min(direct, reverse)
+    return norm(sub(points[0], points[-1]))
+
+
+def refine_param(curve, target, low, high, rounds=3, count=12):
+    """Уточняет параметр, при котором кривая проходит через точку."""
+    best = None
+    for _ in range(rounds):
+        points = sample_range(curve, low, high, count)
+        if not points:
+            return best
+        distances = [norm(sub(point, target)) for point in points]
+        index = min(range(len(points)), key=lambda k: distances[k])
+        span = (high - low) / float(count)
+        best = low + span * index
+        low, high = best - span, best + span
+    return best
+
+
+def locate_range(curve, ends, count=120):
+    """
+    Подбирает диапазон параметра по концам ребра.
+
+    Нужно, когда кривая не сообщает свой диапазон: без него дуга с
+    параметризацией 0..pi/2 была бы спрямлена в хорду.
+    """
+    if not ends:
+        return None
+    probe = sample_range(curve, 0.0, 2.0 * math.pi, count)
+    if not probe:
+        return None
+
+    span = 2.0 * math.pi / count
+    bounds = []
+    for target in ends:
+        distances = [norm(sub(point, target)) for point in probe]
+        index = min(range(len(probe)), key=lambda k: distances[k])
+        start = span * index
+        bounds.append(refine_param(curve, target, start - span, start + span))
+
+    if None in bounds or abs(bounds[0] - bounds[1]) < 1e-9:
+        return None
+    return tuple(bounds)
+
+
+def curve_points(curve, count, ends=None):
+    """Выборка точек кривой с проверкой диапазона параметра."""
+    if curve is None:
+        return None
+
+    def best_of(ranges):
+        best, best_score = None, None
+        for start, finish in ranges:
+            points = sample_range(curve, start, finish, count)
+            if not points:
+                continue
+            score = mismatch(points, ends)
+            if best_score is None or score < best_score:
+                best, best_score = points, score
+        return best, best_score
+
+    best, best_score = best_of(curve_ranges(curve))
+
+    if best_score is None or best_score > CONFIG["weld_tolerance"]:
+        located = locate_range(curve, ends)
+        if located is not None:
+            found, score = best_of([located])
+            if score is not None and (best_score is None or score < best_score):
+                best, best_score = found, score
+                STATS["located"] += 1
+
+    if best is None or best_score > CONFIG["weld_tolerance"]:
+        # Ни один диапазон не сошёлся с ребром — выборке доверять нельзя.
+        return None
+    return best
 
 
 def edge_vertices(edge):
@@ -936,12 +1028,15 @@ def edge_polyline(edge, samples=64):
     Ребро как ломаная в 3D. Кривые аппроксимируются точками, прямые
     остаются двумя точками. Возвращает список точек или None.
     """
-    points = curve_points(curve_of(edge), samples)
+    ends = edge_vertices(edge)
+    points = curve_points(curve_of(edge), samples, ends)
     if points:
+        STATS["curve"] += 1
         return dedupe(points)
-    points = edge_vertices(edge)
-    if points:
-        return dedupe(points)
+    if ends:
+        STATS["ends"] += 1
+        return dedupe(ends)
+    STATS["failed"] += 1
     return None
 
 
@@ -1109,13 +1204,82 @@ def analyse_contours(loops):
     return PlanarFace(loops, center, normal, area)
 
 
-def find_plate_faces(faces):
+def face_size(face):
+    """Габарит контура грани в её плоскости."""
+    axis_x, axis_y = plane_axes(face.normal)
+    flat = [project(point, face.origin, axis_x, axis_y)
+            for loop in face.loops for point in loop]
+    if not flat:
+        return 0.0, 0.0
+    width = max(x for x, _ in flat) - min(x for x, _ in flat)
+    height = max(y for _, y in flat) - min(y for _, y in flat)
+    return width, height
+
+
+def size_text(face):
+    width, height = face_size(face)
+    return "{:.1f} x {:.1f} мм".format(width, height)
+
+
+def report_candidates(planar, count=5):
+    """Крупнейшие плоские грани — чтобы было видно, из чего шёл выбор."""
+    log("  кандидаты (площадь, габарит, контуров):")
+    for face in planar[:count]:
+        log("    {:>12.2f} мм2   {:>18}   {}".format(
+            face.area, size_text(face), len(face.loops)))
+
+
+def choose_plate_face(planar, thickness_hint):
     """
-    Наибольшая плоская грань и параллельная ей грань с другой стороны листа.
+    Выбирает грань развёртки.
+
+    Наибольшая площадь — ненадёжный признак: грань сгиба или боковина, у
+    которой рёбра прочитаны только по концам, выглядит плоским
+    четырёхугольником и может оказаться крупнее настоящей развёртки.
+    Признак листа надёжнее: две параллельные грани одинаковой площади,
+    разнесённые ровно на толщину материала.
+    """
+    best_pair = None
+    best_area = 0.0
+
+    for index, first in enumerate(planar):
+        for second in planar[index + 1:]:
+            if abs(abs(dot(first.normal, second.normal)) - 1.0) > 1e-3:
+                continue
+            distance = abs(dot(sub(second.origin, first.origin), first.normal))
+            if distance < 1e-6:
+                continue  # грани в одной плоскости — это не лист
+            if thickness_hint is not None:
+                allowed = max(thickness_hint * 0.05, 0.05)
+                if abs(distance - thickness_hint) > allowed:
+                    continue
+            smaller = min(first.area, second.area)
+            larger = max(first.area, second.area)
+            if smaller < larger * 0.9:
+                continue
+            if larger > best_area:
+                best_area = larger
+                best_pair = (first, second, distance)
+
+    if best_pair is not None:
+        first, second, distance = best_pair
+        face = first if first.area >= second.area else second
+        other = second if face is first else first
+        ok("грань выбрана по паре сторон листа")
+        return face, other, distance
+
+    warn("пара сторон листа не найдена — берём наибольшую плоскую грань.")
+    return planar[0], None, None
+
+
+def find_plate_faces(faces, thickness_hint=None):
+    """
+    Грань развёртки и параллельная ей грань с другой стороны листа.
     Возвращает (грань, толщина, габарит_по_нормали) или (None, None, None).
     """
-    step("Поиск наибольшей плоской грани")
+    step("Поиск грани развёртки")
 
+    STATS.update({"curve": 0, "ends": 0, "failed": 0, "located": 0})
     planar = []
     all_points = []
     for face in faces:
@@ -1136,27 +1300,26 @@ def find_plate_faces(faces):
             planar.append(result)
 
     log("  граней просмотрено: {}, плоских: {}".format(len(faces), len(planar)))
+    log("  рёбра: по кривой {}, по концам {}, не прочитано {}"
+        " (диапазон подобран у {})".format(
+            STATS["curve"], STATS["ends"], STATS["failed"], STATS["located"]))
+    if STATS["ends"] > STATS["curve"]:
+        warn("большинство рёбер прочитано только по концам — дуги будут спрямлены.")
     if not planar:
         err("плоских граней не найдено.")
         return None, None, None
 
     planar.sort(key=lambda item: item.area, reverse=True)
-    best = planar[0]
-    ok("наибольшая грань: площадь {:.2f} мм2".format(best.area))
+    report_candidates(planar)
 
-    # Противоположная грань листа: параллельная, той же площади.
-    opposite = None
-    for candidate in planar[1:]:
-        if abs(abs(dot(candidate.normal, best.normal)) - 1.0) > 1e-3:
-            continue
-        if abs(candidate.area - best.area) > best.area * 0.05:
-            continue
-        opposite = candidate
-        break
+    best, opposite, thickness = choose_plate_face(planar, thickness_hint)
+    if best is None:
+        return None, None, None
 
-    thickness = None
+    ok("выбрана грань: площадь {:.2f} мм2, габарит {}".format(
+        best.area, size_text(best)))
+
     if opposite is not None:
-        thickness = abs(dot(sub(opposite.origin, best.origin), best.normal))
         ok("толщина материала: {:.2f} мм".format(thickness))
         # Наружу — в сторону, противоположную материалу: контур не зеркалится.
         material = sub(opposite.origin, best.origin)
@@ -1546,7 +1709,7 @@ def export_active_part(application):
             err("не удалось получить грани детали.")
             return False
 
-        face, thickness, extent = find_plate_faces(faces)
+        face, thickness, extent = find_plate_faces(faces, sheet_thickness(part))
         if face is None:
             return False
 
