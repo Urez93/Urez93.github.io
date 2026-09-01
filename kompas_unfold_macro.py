@@ -502,7 +502,7 @@ def set_fixed_face(holder, part):
     Назначает неподвижную грань развёртки, если в модели она не задана.
     Берётся наибольшая плоская грань — обычно это основание детали.
     """
-    face, _, _ = find_plate_faces(get_bodies(part))
+    face, _, _ = find_plate_faces(collect_faces(get_bodies(part)))
     if face is None or face.source is None:
         return False
 
@@ -712,6 +712,101 @@ def get_edges(owner):
             _, edges = fetch(definition, EDGE_NAMES)
             items = as_list(edges)
     return [unwrap_edge(item) for item in items]
+
+
+# ============================================================
+# ГЕОМЕТРИЯ ЧЕРЕЗ API5
+# ============================================================
+#
+# В API7 обход граней не предусмотрен: IBody7 отдаёт только идентификаторы и
+# габарит, а IFace получают выбором мышью. Полный обход B-Rep есть в API5
+# (ksPart.EntityCollection), которое работает параллельно с API7 в той же
+# запущенной копии КОМПАСа. Поэтому геометрию читаем через API5.
+
+API5_GUID = "{0422828C-F174-495E-AC5D-D31014DBBE87}"
+TOP_PART = -1  # pTop_Part
+
+_API5 = {"part": None, "face_code": None, "tried": False}
+
+
+def api5_part():
+    """Верхняя деталь активного документа через API5."""
+    if _API5["tried"]:
+        return _API5["part"]
+    _API5["tried"] = True
+
+    try:
+        import pythoncom
+        from win32com.client import Dispatch, gencache
+    except ImportError:
+        return None
+
+    try:
+        module5 = gencache.EnsureModule(API5_GUID, 0, 1, 0)
+        kompas5 = module5.KompasObject(
+            Dispatch("Kompas.Application.5")._oleobj_.QueryInterface(
+                module5.KompasObject.CLSID, pythoncom.IID_IDispatch
+            )
+        )
+        document = kompas5.ActiveDocument3D()
+        _API5["part"] = document.GetPart(TOP_PART) if document else None
+    except Exception as exc:
+        warn("API5 недоступно: {}".format(exc))
+        _API5["part"] = None
+    return _API5["part"]
+
+
+def looks_like_face(definition):
+    """Похож ли объект на определение грани: у грани есть рёбра или циклы."""
+    if definition is None:
+        return False
+    _, edges = fetch(definition, EDGE_NAMES)
+    if edges is not None:
+        return True
+    _, loops = fetch(definition, LOOP_NAMES)
+    return loops is not None
+
+
+def api5_faces():
+    """
+    Грани детали через API5. Код типа "грань" в EntityCollection подбирается
+    один раз перебором и запоминается — так макрос не зависит от значений
+    констант конкретной сборки.
+    """
+    part5 = api5_part()
+    if part5 is None:
+        return []
+
+    known = _API5["face_code"]
+    codes = [known] if known is not None else range(0, 40)
+
+    for code in codes:
+        try:
+            collection = part5.EntityCollection(code)
+        except Exception:
+            continue
+        items = as_list(collection)
+        if not items:
+            continue
+        faces = [value_of(item, DEFINITION_NAMES) or item for item in items]
+        if not looks_like_face(faces[0]):
+            continue
+        if known is None:
+            ok("грани получены через API5: EntityCollection({}), всего {}"
+               .format(code, len(faces)))
+            _API5["face_code"] = code
+        return faces
+    return []
+
+
+def collect_faces(bodies):
+    """Грани детали: сначала API7, при отсутствии обхода — API5."""
+    faces = []
+    for body in bodies:
+        faces.extend(get_faces(body))
+    if faces:
+        return faces
+    return api5_faces()
 
 
 def face_contours(face):
@@ -1014,7 +1109,7 @@ def analyse_contours(loops):
     return PlanarFace(loops, center, normal, area)
 
 
-def find_plate_faces(bodies):
+def find_plate_faces(faces):
     """
     Наибольшая плоская грань и параллельная ей грань с другой стороны листа.
     Возвращает (грань, толщина, габарит_по_нормали) или (None, None, None).
@@ -1023,28 +1118,24 @@ def find_plate_faces(bodies):
 
     planar = []
     all_points = []
-    total_faces = 0
-    for body in bodies:
-        faces = get_faces(body)
-        total_faces += len(faces)
-        for face in faces:
-            try:
-                loops = face_contours(face)
-            except Exception:
-                continue
-            if not loops:
-                continue
-            for loop in loops:
-                all_points.extend(loop)
-            try:
-                result = analyse_contours(loops)
-            except Exception:
-                result = None
-            if result is not None and result.area > 0:
-                result.source = face
-                planar.append(result)
+    for face in faces:
+        try:
+            loops = face_contours(face)
+        except Exception:
+            continue
+        if not loops:
+            continue
+        for loop in loops:
+            all_points.extend(loop)
+        try:
+            result = analyse_contours(loops)
+        except Exception:
+            result = None
+        if result is not None and result.area > 0:
+            result.source = face
+            planar.append(result)
 
-    log("  граней просмотрено: {}, плоских: {}".format(total_faces, len(planar)))
+    log("  граней просмотрено: {}, плоских: {}".format(len(faces), len(planar)))
     if not planar:
         err("плоских граней не найдено.")
         return None, None, None
@@ -1350,21 +1441,35 @@ def probe(application):
             break
 
     bodies = get_bodies(part)
-    if not bodies:
-        log("\nТела детали не получены — проверьте имена из списка BODY_NAMES.")
-        return
-    describe(bodies[0], "Тело (IBody7)")
+    if bodies:
+        describe(bodies[0], "Тело (IBody7)")
 
-    faces = get_faces(bodies[0])
-    log("\nГраней в первом теле: {}".format(len(faces)))
+    part5 = api5_part()
+    describe(part5, "Деталь через API5 (ksPart)")
+    if part5 is not None:
+        for code in range(0, 40):
+            try:
+                collection = part5.EntityCollection(code)
+            except Exception:
+                continue
+            items = as_list(collection)
+            if items:
+                definition = value_of(items[0], DEFINITION_NAMES)
+                log("    EntityCollection({}): {} шт., определение: {}, грань: {}"
+                    .format(code, len(items),
+                            type(definition).__name__,
+                            looks_like_face(definition or items[0])))
+
+    faces = collect_faces(bodies)
+    log("\nГраней получено: {}".format(len(faces)))
     if not faces:
         return
-    describe(faces[0], "Грань (IFace)")
+    describe(faces[0], "Грань")
 
     loops = get_loops(faces[0])
     log("\nЦиклов в первой грани: {}".format(len(loops)))
     if loops:
-        describe(loops[0], "Цикл (ILoop7)")
+        describe(loops[0], "Цикл")
 
     owner = loops[0] if loops else faces[0]
     _, raw_edges = fetch(owner, EDGE_NAMES)
@@ -1375,7 +1480,10 @@ def probe(application):
     describe(raw_items[0], "Ребро как отдало API")
 
     edge = unwrap_edge(raw_items[0])
-    describe(edge, "Ребро после приведения (IEdge)")
+    describe(edge, "Ребро после приведения")
+
+    definition = value_of(edge, DEFINITION_NAMES)
+    describe(definition, "Определение ребра")
 
     describe(curve_of(edge), "Кривая ребра")
 
@@ -1433,12 +1541,12 @@ def export_active_part(application):
         if not unfolded:
             return False
 
-        bodies = get_bodies(part)
-        if not bodies:
-            err("не удалось получить тела детали.")
+        faces = collect_faces(get_bodies(part))
+        if not faces:
+            err("не удалось получить грани детали.")
             return False
 
-        face, thickness, extent = find_plate_faces(bodies)
+        face, thickness, extent = find_plate_faces(faces)
         if face is None:
             return False
 
