@@ -470,9 +470,12 @@ def ensure_unfolded(part):
         ok("модель уже развёрнута")
         return True, None
 
+    created = value_of(holder, ["IsCreated"])
+    if created is False:
+        warn("параметры развёртки в модели не заданы (нет неподвижной грани).")
+
     try:
-        setattr(holder, flag, True)
-        rebuild(part)
+        apply_unfold(holder, flag, True, part)
         ok("развёртка включена (свойство '{}')".format(flag))
     except Exception as exc:
         err("не удалось включить развёртку: {}".format(exc))
@@ -481,13 +484,20 @@ def ensure_unfolded(part):
 
     def restore():
         try:
-            setattr(holder, flag, previous)
-            rebuild(part)
+            apply_unfold(holder, flag, previous, part)
             ok("состояние развёртки возвращено к исходному")
         except Exception as exc:
             warn("не удалось вернуть состояние развёртки: {}".format(exc))
 
     return True, restore
+
+
+def apply_unfold(holder, flag, state, part):
+    """Меняет состояние развёртки и пересчитывает модель."""
+    setattr(holder, flag, state)
+    # У параметров развёртки изменения применяет отдельный вызов.
+    fetch(holder, ["UpdateParam", "Update", "Apply"])
+    rebuild(part)
 
 
 def rebuild(part):
@@ -533,8 +543,29 @@ MODEL_OPERATION_NAMES = [
 BODY_RESULT_NAMES = ["OperationResult", "ResultBody", "ResultBodies", "Body"]
 
 
+def interface_names(collection_name):
+    """
+    Имя интерфейса элемента коллекции: SheetMetalBodies -> ISheetMetalBody,
+    Extrusions -> IExtrusion, Holes3D -> IHole3D.
+    """
+    base = collection_name
+    if base.endswith("ies"):
+        base = base[:-3] + "y"
+    elif base.endswith("s3D"):
+        base = base[:-3] + "3D"
+    elif base.endswith("s"):
+        base = base[:-1]
+    return ["I" + base, "I" + base + "7"]
+
+
 def operations(part):
-    """Все операции модели — листовые и обычные."""
+    """
+    Операции модели с именами их интерфейсов.
+
+    Коллекции отдают элементы обобщённым IModelObject, у которого нет ни
+    OperationResult, ни параметров операции, поэтому каждый элемент нужно
+    приводить к интерфейсу своей операции.
+    """
     result = []
     sources = (
         (sheet_container(part), SHEET_OPERATION_NAMES),
@@ -548,7 +579,8 @@ def operations(part):
                 collection = getattr(container, name)
             except Exception:
                 continue
-            result.extend(as_list(collection))
+            for item in as_list(collection):
+                result.append(qi(item, *interface_names(name)))
     return result
 
 
@@ -1277,10 +1309,12 @@ def probe(application):
 
     found = operations(part)
     log("\nОпераций в модели: {}".format(len(found)))
-    if found:
-        describe(found[0], "Первая операция")
-        name, result = fetch(found[0], BODY_RESULT_NAMES)
+    for index, operation in enumerate(found):
+        describe(operation, "Операция [{}]".format(index))
+        name, result = fetch(operation, BODY_RESULT_NAMES)
         log("\nРезультат операции ({}): {}".format(name, type(result).__name__))
+        if index >= 1:
+            break
 
     bodies = get_bodies(part)
     if not bodies:
