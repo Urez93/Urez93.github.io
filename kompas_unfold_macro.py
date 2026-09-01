@@ -61,6 +61,7 @@ CONFIG = {
     # Поведение
     "unfold_sheet_metal": True,   # разворачивать листовое тело автоматически
     "probe_on_error": True,       # при сбое печатать дамп API
+    "mode": "",                   # "probe" — только диагностика, без экспорта
 }
 
 
@@ -108,25 +109,31 @@ def api7_module():
     return _API7_MODULE[0] or None
 
 
-def qi(obj, *names):
+def qi(obj, *names, **kwargs):
     """
     Приведение COM-объекта к конкретному интерфейсу API7.
 
-    В API7 свойства возвращают обобщённые интерфейсы: ActiveDocument отдаёт
-    IKompasDocument, у которого нет TopPart. Нужную "грань" объекта получают
-    через QueryInterface — этим и занимается функция. Если привести не
-    удалось, возвращается исходный объект.
+    В API7 многое доступно не через свойства, а через QueryInterface:
+    ActiveDocument отдаёт IKompasDocument без TopPart, у IPart7 нет тел —
+    они лежат в IModelContainer, а листовые операции в ISheetMetalContainer.
+
+    strict=False (по умолчанию) — при неудаче вернуть исходный объект,
+    strict=True — вернуть None (нужно, когда сам факт приведения является
+    признаком, например наличия листового тела).
     """
+    strict = kwargs.get("strict", False)
+    fallback = None if strict else obj
+
     if obj is None:
         return None
     module = api7_module()
     if module is None:
-        return obj
+        return fallback
 
     try:
         import pythoncom
     except ImportError:
-        return obj
+        return fallback
 
     source = getattr(obj, "_oleobj_", obj)
     for name in names:
@@ -139,7 +146,7 @@ def qi(obj, *names):
             )
         except Exception:
             continue
-    return obj
+    return fallback
 
 
 def connect_kompas():
@@ -369,9 +376,28 @@ def get_article(part, path):
 # ЛИСТОВОЕ ТЕЛО И РАЗВЁРТКА
 # ============================================================
 
-SHEET_CONTAINER_NAMES = ["SheetMetalContainer", "SheetMetal", "SheetMetalBodies"]
-UNFOLD_FLAG_NAMES = ["Unfolded", "Unfold", "IsUnfolded", "UnfoldState"]
-UNFOLD_HOLDER_NAMES = ["UnfoldParam", "Unfolds", "Unfold", "UnfoldParams"]
+SHEET_BODY_NAMES = ["SheetMetalBodies", "Bodies", "SheetMetalBody"]
+UNFOLD_FLAG_NAMES = ["Unfolded", "Unfold", "IsUnfolded", "UnfoldState",
+                     "Unfolding", "IsUnfold"]
+UNFOLD_HOLDER_NAMES = ["UnfoldParam", "UnfoldParameters", "Unfolds",
+                       "UnfoldParams", "Unfold"]
+
+
+def sheet_container(part):
+    """
+    Контейнер листовых операций. В API7 это не свойство детали, а отдельный
+    интерфейс, к которому деталь приводится через QueryInterface.
+    """
+    return qi(part, "ISheetMetalContainer", strict=True)
+
+
+def sheet_bodies(part):
+    """Листовые тела детали."""
+    container = sheet_container(part)
+    if container is None:
+        return []
+    _, bodies = fetch(container, SHEET_BODY_NAMES)
+    return [qi(body, "ISheetMetalBody") for body in as_list(bodies)]
 
 
 def find_unfold_flag(part):
@@ -379,11 +405,13 @@ def find_unfold_flag(part):
     Ищет объект и имя свойства, управляющего состоянием развёртки.
     Возвращает (владелец, имя_свойства) или (None, None).
     """
-    container_name, container = fetch(part, SHEET_CONTAINER_NAMES)
-    holders = [part]
+    holders = []
+    container = sheet_container(part)
     if container is not None:
         holders.append(container)
-        _, nested = fetch(container, UNFOLD_HOLDER_NAMES)
+    for body in sheet_bodies(part):
+        holders.append(body)
+        _, nested = fetch(body, UNFOLD_HOLDER_NAMES)
         if nested is not None:
             holders.extend(as_list(nested) or [nested])
 
@@ -400,15 +428,7 @@ def find_unfold_flag(part):
 
 def is_sheet_metal(part):
     """Есть ли у детали листовое тело."""
-    name, container = fetch(part, SHEET_CONTAINER_NAMES)
-    if container is None:
-        return False
-    bodies = as_list(container)
-    if bodies:
-        return True
-    # Контейнер есть, но пустой либо не является коллекцией — считаем,
-    # что признак листового тела всё же присутствует.
-    return name is not None
+    return bool(sheet_bodies(part))
 
 
 def ensure_unfolded(part):
@@ -483,35 +503,67 @@ def rebuild(part):
 # ============================================================
 
 BODY_NAMES = ["Bodies", "BodyCollection", "Body"]
-FACE_NAMES = ["Faces", "FaceCollection", "Face"]
-EDGE_NAMES = ["EdgeCollection", "Edges", "GetEdges"]
+FACE_NAMES = ["FaceCollection", "Faces", "Face"]
+LOOP_NAMES = ["LoopCollection", "Loops", "Loop"]
+EDGE_NAMES = ["EdgeCollection", "Edges", "OrientedEdges", "GetEdges"]
+ORIENTED_EDGE_NAMES = ["Edge", "GetEdge", "BaseEdge"]
 CURVE_NAMES = ["GetCurve3D", "Curve3D", "GetCurve"]
 DEFINITION_NAMES = ["GetDefinition", "Definition"]
 
 
 def get_bodies(part):
-    name, bodies = fetch(part, BODY_NAMES)
-    items = [qi(item, "IBody7", "IBody") for item in as_list(bodies)]
+    """Тела детали. В API7 они лежат в IModelContainer, а не в IPart7."""
+    container = qi(part, "IModelContainer")
+    name, bodies = fetch(container, BODY_NAMES)
+    items = [qi(item, "IBody7") for item in as_list(bodies)]
     if items:
-        ok("тел в детали: {} (через '{}')".format(len(items), name))
+        ok("тел в детали: {} (IModelContainer.{})".format(len(items), name))
     return items
 
 
 def get_faces(body):
     _, faces = fetch(body, FACE_NAMES)
-    return [qi(item, "IFace", "IFace7") for item in as_list(faces)]
+    return [qi(item, "IFace") for item in as_list(faces)]
 
 
-def get_edges(face):
-    _, edges = fetch(face, EDGE_NAMES)
+def get_loops(face):
+    """Циклы грани: внешний контур и отверстия, каждый уже упорядочен."""
+    _, loops = fetch(face, LOOP_NAMES)
+    return [qi(item, "ILoop7") for item in as_list(loops)]
+
+
+def unwrap_edge(item):
+    """IOrientedEdge7 -> IEdge; обычное ребро возвращается как есть."""
+    _, inner = fetch(item, ORIENTED_EDGE_NAMES)
+    if inner is not None:
+        item = inner
+    return qi(item, "IEdge")
+
+
+def get_edges(owner):
+    """Рёбра грани или цикла."""
+    _, edges = fetch(owner, EDGE_NAMES)
     items = as_list(edges)
     if not items:
-        # API5-подобная схема: сначала определение грани, потом её рёбра.
-        _, definition = fetch(face, DEFINITION_NAMES)
+        # API5-подобная схема: сначала определение объекта, потом его рёбра.
+        _, definition = fetch(owner, DEFINITION_NAMES)
         if definition is not None:
             _, edges = fetch(definition, EDGE_NAMES)
             items = as_list(edges)
-    return [qi(item, "IEdge", "IEdge7") for item in items]
+    return [unwrap_edge(item) for item in items]
+
+
+def face_contours(face):
+    """
+    Контуры грани в 3D. Если API отдаёт циклы — берём их (внешний контур и
+    отверстия разделены самим КОМПАСом), иначе сшиваем рёбра по концам.
+    """
+    contours = []
+    for loop in get_loops(face):
+        contours.extend(build_loops(get_edges(loop)))
+    if contours:
+        return contours
+    return build_loops(get_edges(face))
 
 
 def curve_of(edge):
@@ -770,7 +822,7 @@ def plane_axes(normal):
 
 def analyse_face(face):
     """Плоская грань -> PlanarFace; None, если грань не плоская."""
-    loops = build_loops(get_edges(face))
+    loops = face_contours(face)
     if not loops:
         return None
 
@@ -1048,11 +1100,13 @@ def list_interfaces():
     if module is None:
         log("    модуль API7 недоступен")
         return
-    keywords = ("Part", "Body", "Face", "Edge", "Vertex", "Curve",
-                "Sheet", "Unfold", "Document3D", "Loop", "Model")
+    keywords = ("Body", "Face", "Edge", "Vertex", "Loop",
+                "Container", "Unfold")
     names = sorted(
         name for name in dir(module)
-        if name.startswith("I") and any(key in name for key in keywords)
+        if name.startswith("I")
+        and "_vtables_" not in name
+        and any(key in name for key in keywords)
     )
     for name in names:
         log("    {}".format(name))
@@ -1082,36 +1136,49 @@ def probe(application):
 
     describe(part, "Деталь (IPart7)")
 
-    container_name, container = fetch(part, SHEET_CONTAINER_NAMES)
-    log("\nКонтейнер листового тела: {}".format(container_name or "не найден"))
-    describe(container, "Контейнер листового тела")
+    model_container = qi(part, "IModelContainer", strict=True)
+    describe(model_container, "IModelContainer (тела и объекты модели)")
 
-    holder, flag = find_unfold_flag(part)
-    log("\nПризнак развёртки: {}".format(flag or "не найден"))
+    sheet = sheet_container(part)
+    describe(sheet, "ISheetMetalContainer (листовые операции)")
+    bodies_sm = sheet_bodies(part)
+    log("\nЛистовых тел: {}".format(len(bodies_sm)))
+    if bodies_sm:
+        describe(bodies_sm[0], "ISheetMetalBody")
+        holder, flag = find_unfold_flag(part)
+        log("\nПризнак развёртки: {}".format(flag or "не найден"))
 
     bodies = get_bodies(part)
     if not bodies:
         log("\nТела детали не получены — проверьте имена из списка BODY_NAMES.")
         return
-    describe(bodies[0], "Тело")
+    describe(bodies[0], "Тело (IBody7)")
 
     faces = get_faces(bodies[0])
     log("\nГраней в первом теле: {}".format(len(faces)))
     if not faces:
         return
-    describe(faces[0], "Грань")
+    describe(faces[0], "Грань (IFace)")
 
-    edges = get_edges(faces[0])
-    log("\nРёбер в первой грани: {}".format(len(edges)))
-    if not edges:
+    loops = get_loops(faces[0])
+    log("\nЦиклов в первой грани: {}".format(len(loops)))
+    if loops:
+        describe(loops[0], "Цикл (ILoop7)")
+
+    owner = loops[0] if loops else faces[0]
+    _, raw_edges = fetch(owner, EDGE_NAMES)
+    raw_items = as_list(raw_edges)
+    log("\nРёбер получено: {}".format(len(raw_items)))
+    if not raw_items:
         return
-    describe(edges[0], "Ребро")
+    describe(raw_items[0], "Ребро как отдало API")
 
-    curve = curve_of(edges[0])
-    describe(curve, "Кривая ребра")
+    edge = unwrap_edge(raw_items[0])
+    describe(edge, "Ребро после приведения (IEdge)")
 
-    points = edge_polyline(edges[0], samples=4)
-    log("\nТочки первого ребра: {}".format(points))
+    describe(curve_of(edge), "Кривая ребра")
+
+    log("\nТочки первого ребра: {}".format(edge_polyline(edge, samples=4)))
 
 
 # ============================================================
@@ -1182,7 +1249,7 @@ def run_macro(mode=None):
         return False
 
     if mode is None:
-        mode = command_line_mode()
+        mode = CONFIG["mode"] or command_line_mode()
     if mode in ("probe", "diag", "-p"):
         probe(application)
         return True
