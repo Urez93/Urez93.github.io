@@ -381,6 +381,8 @@ UNFOLD_FLAG_NAMES = ["Unfolded", "Unfold", "IsUnfolded", "UnfoldState",
                      "Unfolding", "IsUnfold"]
 UNFOLD_HOLDER_NAMES = ["UnfoldParam", "UnfoldParameters", "Unfolds",
                        "UnfoldParams", "Unfold"]
+UNFOLD_PARAMETER_NAMES = ["SheetMetalBendUnfoldParameters",
+                          "BendUnfoldParameters", "UnfoldParameters"]
 
 
 def sheet_container(part):
@@ -409,11 +411,15 @@ def find_unfold_flag(part):
     container = sheet_container(part)
     if container is not None:
         holders.append(container)
+        # Параметры развёртки хранятся отдельным объектом контейнера.
+        _, parameters = fetch(container, UNFOLD_PARAMETER_NAMES)
+        if parameters is not None:
+            holders.extend(as_list(parameters))
     for body in sheet_bodies(part):
         holders.append(body)
         _, nested = fetch(body, UNFOLD_HOLDER_NAMES)
         if nested is not None:
-            holders.extend(as_list(nested) or [nested])
+            holders.extend(as_list(nested))
 
     for holder in holders:
         for name in UNFOLD_FLAG_NAMES:
@@ -511,14 +517,106 @@ CURVE_NAMES = ["GetCurve3D", "Curve3D", "GetCurve"]
 DEFINITION_NAMES = ["GetDefinition", "Definition"]
 
 
+SHEET_OPERATION_NAMES = [
+    "SheetMetalBodies", "SheetMetalPlates", "SheetMetalRuledShells",
+    "SheetMetalLinearRuledShells", "ConvertsToSheetMetals", "SheetMetalBends",
+    "SheetMetalSketchBends", "SheetMetalLineBends", "SheetMetalCuts",
+]
+
+MODEL_OPERATION_NAMES = [
+    "Extrusions", "Rotateds", "Lofts", "Evolutions", "Booleans", "Cuts",
+    "Shells", "SurfaceThickenings", "SplitSolids", "CopiesGeometry",
+    "CollectionsGeometry", "FeaturePatterns", "Fillets", "Chamfers",
+    "Holes3D", "Ribs", "Inclines", "MacroObjects3D", "UserObjects",
+]
+
+BODY_RESULT_NAMES = ["OperationResult", "ResultBody", "ResultBodies", "Body"]
+
+
+def operations(part):
+    """Все операции модели — листовые и обычные."""
+    result = []
+    sources = (
+        (sheet_container(part), SHEET_OPERATION_NAMES),
+        (qi(part, "IModelContainer", strict=True), MODEL_OPERATION_NAMES),
+    )
+    for container, names in sources:
+        if container is None:
+            continue
+        for name in names:
+            try:
+                collection = getattr(container, name)
+            except Exception:
+                continue
+            result.extend(as_list(collection))
+    return result
+
+
 def get_bodies(part):
-    """Тела детали. В API7 они лежат в IModelContainer, а не в IPart7."""
-    container = qi(part, "IModelContainer")
-    name, bodies = fetch(container, BODY_NAMES)
-    items = [qi(item, "IBody7") for item in as_list(bodies)]
-    if items:
-        ok("тел в детали: {} (IModelContainer.{})".format(len(items), name))
-    return items
+    """
+    Тела детали.
+
+    У IPart7 коллекции тел нет, а IModelContainer хранит операции, а не тела.
+    Поэтому тело берётся из результата любой операции модели: OperationResult
+    возвращает то тело, которому операция принадлежит.
+    """
+    found = []
+    keys = set()
+
+    def remember(obj):
+        body = qi(obj, "IBody7", strict=True)
+        if body is None:
+            return
+        key = value_of(body, ["Reference"]) or value_of(body, ["Name"], "")
+        if key in keys:
+            return
+        keys.add(key)
+        found.append(body)
+
+    for operation in operations(part):
+        _, result = fetch(operation, BODY_RESULT_NAMES)
+        for item in as_list(result):
+            remember(item)
+
+    if not found:
+        found = bodies_via_objects(part)
+
+    if found:
+        ok("тел в детали: {}".format(len(found)))
+    return found
+
+
+def bodies_via_objects(part):
+    """
+    Запасной путь: перебор объектов модели через IModelContainer.Objects.
+    Свойство может быть и методом с кодом типа объекта — пробуем оба вида.
+    """
+    container = qi(part, "IModelContainer", strict=True)
+    if container is None:
+        return []
+
+    candidates = []
+    try:
+        raw = getattr(container, "Objects")
+    except Exception:
+        return []
+
+    if callable(raw):
+        for code in range(0, 40):
+            try:
+                collection = raw(code)
+            except Exception:
+                continue
+            items = as_list(collection)
+            if items and qi(items[0], "IBody7", strict=True) is not None:
+                ok("тела найдены через Objects({})".format(code))
+                candidates = items
+                break
+    else:
+        candidates = as_list(raw)
+
+    bodies = [qi(item, "IBody7", strict=True) for item in candidates]
+    return [body for body in bodies if body is not None]
 
 
 def get_faces(body):
@@ -822,7 +920,11 @@ def plane_axes(normal):
 
 def analyse_face(face):
     """Плоская грань -> PlanarFace; None, если грань не плоская."""
-    loops = face_contours(face)
+    return analyse_contours(face_contours(face))
+
+
+def analyse_contours(loops):
+    """Контуры грани -> PlanarFace; None, если они не лежат в одной плоскости."""
     if not loops:
         return None
 
@@ -851,18 +953,27 @@ def analyse_face(face):
 def find_plate_faces(bodies):
     """
     Наибольшая плоская грань и параллельная ей грань с другой стороны листа.
-    Возвращает (грань, толщина) или (None, None).
+    Возвращает (грань, толщина, габарит_по_нормали) или (None, None, None).
     """
     step("Поиск наибольшей плоской грани")
 
     planar = []
+    all_points = []
     total_faces = 0
     for body in bodies:
         faces = get_faces(body)
         total_faces += len(faces)
         for face in faces:
             try:
-                result = analyse_face(face)
+                loops = face_contours(face)
+            except Exception:
+                continue
+            if not loops:
+                continue
+            for loop in loops:
+                all_points.extend(loop)
+            try:
+                result = analyse_contours(loops)
             except Exception:
                 result = None
             if result is not None and result.area > 0:
@@ -871,7 +982,7 @@ def find_plate_faces(bodies):
     log("  граней просмотрено: {}, плоских: {}".format(total_faces, len(planar)))
     if not planar:
         err("плоских граней не найдено.")
-        return None, None
+        return None, None, None
 
     planar.sort(key=lambda item: item.area, reverse=True)
     best = planar[0]
@@ -899,7 +1010,14 @@ def find_plate_faces(bodies):
         warn("парная грань не найдена, толщина не определена.")
         log("      Возможен зеркальный контур — проверьте деталь перед резкой.")
 
-    return best, thickness
+    # Габарит детали поперёк наибольшей грани: у плоской заготовки он равен
+    # толщине листа, у согнутой — заметно больше.
+    extent = 0.0
+    for point in all_points:
+        extent = max(extent, abs(dot(sub(point, best.origin), best.normal)))
+    ok("габарит поперёк грани: {:.2f} мм".format(extent))
+
+    return best, thickness, extent
 
 
 # ============================================================
@@ -1145,8 +1263,24 @@ def probe(application):
     log("\nЛистовых тел: {}".format(len(bodies_sm)))
     if bodies_sm:
         describe(bodies_sm[0], "ISheetMetalBody")
-        holder, flag = find_unfold_flag(part)
-        log("\nПризнак развёртки: {}".format(flag or "не найден"))
+        log("\nТолщина листа: {}".format(sheet_thickness(part)))
+
+    _, parameters = fetch(sheet, UNFOLD_PARAMETER_NAMES)
+    describe(parameters, "Параметры развёртки (объект контейнера)")
+    for index, item in enumerate(as_list(parameters)):
+        describe(item, "Параметры развёртки [{}]".format(index))
+        if index >= 1:
+            break
+
+    holder, flag = find_unfold_flag(part)
+    log("\nПризнак развёртки: {}".format(flag or "не найден"))
+
+    found = operations(part)
+    log("\nОпераций в модели: {}".format(len(found)))
+    if found:
+        describe(found[0], "Первая операция")
+        name, result = fetch(found[0], BODY_RESULT_NAMES)
+        log("\nРезультат операции ({}): {}".format(name, type(result).__name__))
 
     bodies = get_bodies(part)
     if not bodies:
@@ -1185,6 +1319,43 @@ def probe(application):
 # ГЛАВНАЯ ПРОЦЕДУРА
 # ============================================================
 
+def sheet_thickness(part):
+    """Толщина листа из параметров листового тела."""
+    for body in sheet_bodies(part):
+        value = value_of(body, ["Thickness"])
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+    return None
+
+
+def check_flat(part, thickness, extent):
+    """
+    Проверяет, что деталь действительно плоская заготовка.
+
+    У развёрнутого листа и у пластины габарит поперёк наибольшей грани равен
+    толщине материала. Если он больше — деталь согнута, и контур наибольшей
+    грани развёрткой не является: молча отдавать такой DXF нельзя.
+    """
+    reference = sheet_thickness(part) or thickness
+    if reference is None:
+        warn("толщину определить не удалось — проверка на плоскостность пропущена.")
+        return True
+
+    limit = reference * 1.5 + 0.5
+    if extent <= limit:
+        return True
+
+    err("деталь не плоская: габарит поперёк грани {:.2f} мм при толщине {:.2f} мм."
+        .format(extent, reference))
+    if is_sheet_metal(part):
+        log("    Разверните листовое тело (Листовое тело -> Развернуть)")
+        log("    и запустите макрос снова.")
+    else:
+        log("    Развёртка возможна только для листового тела. Преобразуйте")
+        log("    деталь командой 'Распознать листовое тело' и повторите.")
+    return False
+
+
 def export_active_part(application):
     document, part, path = get_active_part(application)
     if part is None:
@@ -1200,8 +1371,11 @@ def export_active_part(application):
             err("не удалось получить тела детали.")
             return False
 
-        face, thickness = find_plate_faces(bodies)
+        face, thickness, extent = find_plate_faces(bodies)
         if face is None:
+            return False
+
+        if not check_flat(part, thickness, extent):
             return False
 
         loops = flatten(face)
