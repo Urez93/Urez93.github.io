@@ -49,8 +49,6 @@ from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as _xml_escape
 
 
-DOCUMENT_TYPE_SPECIFICATION = 5  # ksDocumentSpecification
-
 # ---------------------------------------------------------------------------
 # Построение структурированной таблицы (та же логика, что в
 # kompas_bom_structure.py, включена сюда, чтобы макрос не зависел от
@@ -518,27 +516,44 @@ def get_document_path(doc):
     )
 
 
-def find_specification_document(app, active_doc):
-    """Возвращает документ спецификации: сам активный документ либо один из открытых."""
-    try:
-        if getattr(active_doc, "DocumentType", None) == DOCUMENT_TYPE_SPECIFICATION:
-            _log("Активный документ уже является спецификацией.")
-            return active_doc
-    except Exception as e:
-        _log("Не удалось определить тип активного документа: {}".format(e))
+SPECIFICATION_EXTENSION = ".spw"
+
+
+def find_specification_path(app, model_path):
+    """
+    Определяет путь к файлу спецификации (.spw), связанному с активной моделью.
+
+    Числовой код DocumentType в разных версиях API Компаса нестабилен
+    (на практике встретился случай, когда открытый документ .a3d — 3D-модель,
+    а не спецификация — давал DocumentType, совпадающий с ожидаемым кодом
+    спецификации). Поэтому вместо угадывания числового кода определяем
+    спецификацию по расширению файла ".spw" — это стандартное и стабильное
+    соглашение об именовании в Компасе.
+    """
+    if model_path.lower().endswith(SPECIFICATION_EXTENSION):
+        _log("Активный документ уже является спецификацией (.spw).")
+        return model_path
 
     try:
         docs = app.Documents
         for i in range(docs.Count):
             d = docs.Item(i)
             try:
-                if getattr(d, "DocumentType", None) == DOCUMENT_TYPE_SPECIFICATION:
-                    _log("Найдена открытая спецификация: {}".format(getattr(d, "Name", "")))
-                    return d
+                path = get_document_path(d)
             except Exception:
                 continue
+            if path.lower().endswith(SPECIFICATION_EXTENSION):
+                _log("Найдена открытая спецификация: {}".format(path))
+                return path
     except Exception as e:
         _log("Не удалось перебрать открытые документы: {}".format(e))
+
+    folder = os.path.dirname(model_path)
+    base_name = os.path.splitext(os.path.basename(model_path))[0]
+    candidate = os.path.join(folder, base_name + SPECIFICATION_EXTENSION)
+    if os.path.exists(candidate):
+        _log("Найден файл спецификации рядом с моделью (не был открыт): {}".format(candidate))
+        return candidate
 
     return None
 
@@ -594,17 +609,17 @@ def _close_document_without_saving(doc):
     return False
 
 
-def export_specification_safely(app, spec_doc, temp_flat_path):
+def export_specification_safely(app, spec_path, temp_flat_path):
     """
     Безопасно экспортирует спецификацию в excel, НЕ трогая документ,
     открытый у пользователя: делает файловую копию исходного файла
     спецификации под другим именем, открывает копию отдельным
     документом, экспортирует её и закрывает — реальный открытый
-    документ вообще не участвует в SaveAs/Export.
+    документ (если он вообще был открыт) вообще не участвует в
+    SaveAs/Export.
     """
     import shutil
 
-    spec_path = get_document_path(spec_doc)
     if _looks_like_leftover_temp_name(spec_path):
         raise RuntimeError(
             "Открытый документ спецификации сейчас указывает на временный файл "
@@ -677,13 +692,15 @@ def run_macro():
         base_name = os.path.splitext(os.path.basename(model_path))[0]
 
         print()
-        _log("Ищем документ спецификации...")
-        spec_doc = find_specification_document(app, active_doc)
-        if spec_doc is None:
+        _log("Ищем файл спецификации (.spw)...")
+        spec_path = find_specification_path(app, model_path)
+        if spec_path is None:
             raise RuntimeError(
-                "Документ спецификации не найден среди открытых. "
-                "Откройте спецификацию сборки в Компасе (она должна быть "
-                "среди открытых документов) и запустите макрос ещё раз."
+                "Файл спецификации (.spw) не найден: ни активный документ, ни "
+                "другие открытые документы, ни файлы рядом с моделью на диске "
+                "не являются спецификацией. Откройте спецификацию сборки в "
+                "Компасе или убедитесь, что файл '<имя модели>.spw' лежит в "
+                "той же папке, и запустите макрос ещё раз."
             )
 
         temp_flat_path = os.path.join(folder, "~{}_temp_export.xlsx".format(base_name))
@@ -691,7 +708,7 @@ def run_macro():
 
         print()
         _log("Экспортируем спецификацию во временный файл (через отдельную копию, не трогая открытый документ)...")
-        ok = export_specification_safely(app, spec_doc, temp_flat_path)
+        ok = export_specification_safely(app, spec_path, temp_flat_path)
         if not ok:
             raise RuntimeError(
                 "Не удалось экспортировать спецификацию автоматически. "
