@@ -238,7 +238,11 @@ def _group_key(child):
 
 
 def _group_children(children):
-    """Группирует список деталей по _group_key, возвращает [(представитель, количество), ...]."""
+    """
+    Группирует список деталей по _group_key и сортирует результат по
+    наименованию (А-Я), чтобы позиции внутри каждого узла/подузла шли
+    в читаемом алфавитном порядке.
+    """
     order = []
     groups = {}
     for child in children:
@@ -247,7 +251,10 @@ def _group_children(children):
             groups[key] = {"representative": child, "count": 0}
             order.append(key)
         groups[key]["count"] += 1
-    return [(groups[key]["representative"], groups[key]["count"]) for key in order]
+
+    result = [(groups[key]["representative"], groups[key]["count"]) for key in order]
+    result.sort(key=lambda pair: _bom_clean(_safe_attr(pair[0], "Name", "")).lower())
+    return result
 
 
 def collect_bom_rows(part, level=1, rows=None, visited=None, quantity=1):
@@ -314,10 +321,10 @@ def _bom_clean(value):
 
 BOM_OUTPUT_COLUMNS = [
     ("Уровень", "level"),
-    ("Наименование", "Наименование"),
     ("Обозначение", "Обозначение"),
-    ("Материал", "Материал"),
+    ("Наименование", "Наименование"),
     ("Количество", "Количество"),
+    ("Материал", "Материал"),
 ]
 
 
@@ -467,7 +474,7 @@ def _write_xlsx(output_path, header, data_rows, name_col_index):
     last_col_letters = _col_index_to_letters(ncols - 1)
     dimension_ref = "A1:{}{}".format(last_col_letters, last_row_num)
 
-    col_widths = [10, 55, 20, 30, 12]
+    col_widths = [10, 20, 55, 12, 30]
     cols_xml = "".join(
         '<col min="{0}" max="{0}" width="{1}" customWidth="1"/>'.format(
             i + 1, col_widths[i] if i < len(col_widths) else 15
