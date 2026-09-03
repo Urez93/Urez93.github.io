@@ -50,6 +50,7 @@ PartsEx в разных версиях API Компаса может отлич�
 """
 
 import os
+import re
 import zipfile
 from xml.sax.saxutils import escape as _xml_escape
 
@@ -237,11 +238,38 @@ def _group_key(child):
     return (marking, name, material)
 
 
+_STANDARD_MARKING_RE = re.compile(r"(ГОСТ|ОСТ|ТУ|DIN|ISO|EN\s?\d|ANSI)", re.IGNORECASE)
+
+# Порядок категорий внутри узла (чем меньше число, тем выше в таблице):
+# сначала сборочные единицы/подузлы, потом собственные детали, потом
+# стандартные изделия (крепёж и т.п. со ссылкой на ГОСТ/DIN/...), и в
+# самом низу — ПКИ (покупные комплектующие без собственного обозначения).
+CATEGORY_NODE = 0
+CATEGORY_DETAIL = 1
+CATEGORY_STANDARD = 2
+CATEGORY_PKI = 3
+
+
+def _classify(marking, has_children):
+    if has_children:
+        return CATEGORY_NODE
+    if not marking:
+        return CATEGORY_PKI
+    if _STANDARD_MARKING_RE.search(marking):
+        return CATEGORY_STANDARD
+    return CATEGORY_DETAIL
+
+
 def _group_children(children):
     """
-    Группирует список деталей по _group_key и сортирует результат по
-    наименованию (А-Я), чтобы позиции внутри каждого узла/подузла шли
-    в читаемом алфавитном порядке.
+    Группирует список деталей по _group_key (получая заодно детей
+    каждого представителя — пригодится и для классификации, и чтобы не
+    вызывать PartsEx на них повторно при рекурсии), затем сортирует:
+    сначала по категории (узлы/подузлы -> детали -> стандартные изделия
+    -> ПКИ, как в спецификации), внутри категории — по обозначению
+    (А-Я), а если оно пустое (обычно у ПКИ) — по наименованию.
+
+    Возвращает список (представитель, количество, дочерние_детали).
     """
     order = []
     groups = {}
@@ -252,13 +280,27 @@ def _group_children(children):
             order.append(key)
         groups[key]["count"] += 1
 
-    result = [(groups[key]["representative"], groups[key]["count"]) for key in order]
-    result.sort(key=lambda pair: _bom_clean(_safe_attr(pair[0], "Name", "")).lower())
-    return result
+    result = []
+    for key in order:
+        representative = groups[key]["representative"]
+        count = groups[key]["count"]
+        grandchildren = get_child_parts(representative)
+        marking = _bom_clean(_safe_attr(representative, "Marking", ""))
+        name = _bom_clean(_safe_attr(representative, "Name", ""))
+        category = _classify(marking, bool(grandchildren))
+        result.append((representative, count, grandchildren, category, marking, name))
+
+    result.sort(key=lambda item: (item[3], item[4].lower(), item[5].lower()))
+    return [(r, c, gc) for r, c, gc, _cat, _mk, _nm in result]
 
 
-def collect_bom_rows(part, level=1, rows=None, visited=None, quantity=1):
-    """Рекурсивно собирает строки состава изделия из дерева PartsEx."""
+def collect_bom_rows(part, level=1, rows=None, visited=None, quantity=1, children=None):
+    """
+    Рекурсивно собирает строки состава изделия из дерева PartsEx.
+    `children`, если передан, — уже полученный список дочерних деталей
+    этой детали (чтобы не запрашивать PartsEx повторно: он уже был
+    вызван в _group_children родителя при классификации/сортировке).
+    """
     if rows is None:
         rows = []
     if visited is None:
@@ -291,9 +333,11 @@ def collect_bom_rows(part, level=1, rows=None, visited=None, quantity=1):
         _log("  ! Достигнута максимальная глубина {} — дальше не углубляемся.".format(MAX_DEPTH))
         return rows
 
-    children = get_child_parts(part)
-    for representative, count in _group_children(children):
-        collect_bom_rows(representative, level + 1, rows, visited, quantity=count)
+    if children is None:
+        children = get_child_parts(part)
+
+    for representative, count, grandchildren in _group_children(children):
+        collect_bom_rows(representative, level + 1, rows, visited, quantity=count, children=grandchildren)
 
     return rows
 
