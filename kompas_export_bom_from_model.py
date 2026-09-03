@@ -217,6 +217,60 @@ def _safe_attr(obj, name, default=""):
         return default
 
 
+_working_mass_accessor = {"name": None, "logged": False}
+_MASS_ACCESSOR_CANDIDATES = ("Mass", "GetMassCentrProperties", "MassInertiaParams")
+
+
+def _try_mass_accessor(part, name):
+    try:
+        attr = getattr(part, name)
+        result = attr() if callable(attr) else attr
+    except Exception:
+        return None
+    if isinstance(result, bool):
+        return None
+    if isinstance(result, (int, float)):
+        return float(result)
+    mass_attr = getattr(result, "Mass", None)
+    if isinstance(mass_attr, (int, float)) and not isinstance(mass_attr, bool):
+        return float(mass_attr)
+    return None
+
+
+def get_mass(part):
+    """
+    Пытается получить массу ОДНОЙ детали. В отличие от Name/Marking/
+    Material/PartsEx это свойство НЕ подтверждено разведкой API —
+    пробуем несколько вероятных вариантов и запоминаем первый рабочий,
+    как и для PartsEx. Если ни один не сработает — возвращаем None
+    (столбцы "Масса"/"Масса общая" останутся пустыми) и один раз
+    печатаем предупреждение в консоль, а не на каждую деталь.
+    """
+    name = _working_mass_accessor["name"]
+    if name is not None:
+        value = _try_mass_accessor(part, name)
+        if value is not None:
+            return value
+        _working_mass_accessor["name"] = None
+
+    for candidate in _MASS_ACCESSOR_CANDIDATES:
+        value = _try_mass_accessor(part, candidate)
+        if value is not None:
+            _working_mass_accessor["name"] = candidate
+            _log("  ✓ Масса получена через {}".format(candidate))
+            return value
+
+    if not _working_mass_accessor["logged"]:
+        _log(
+            "  ! Не удалось получить массу ни одним из способов {} — "
+            "столбцы Масса останутся пустыми для деталей без неё. Это "
+            "непроверенная часть API — если масса нужна, пришлите "
+            "вывод консоли, подберём точный вызов.".format(_MASS_ACCESSOR_CANDIDATES)
+        )
+        _working_mass_accessor["logged"] = True
+    return None
+
+
 MAX_DEPTH = 15
 MAX_ROWS = 2000
 
@@ -258,6 +312,46 @@ def _classify(marking, has_children):
     if _STANDARD_MARKING_RE.search(marking):
         return CATEGORY_STANDARD
     return CATEGORY_DETAIL
+
+
+_PROFILE_PIPE_KEYWORDS = ("профил", "квадрат", "прямоугольн")
+
+
+def _is_turning_material(material_clean):
+    """
+    Материал идёт на токарную обработку: "Круг..." — всегда; "Труба..."
+    — только круглая (не профильная/квадратная/прямоугольная — такая
+    труба идёт в обычный металл, см. согласованное правило).
+    """
+    if not material_clean:
+        return False
+    text = material_clean.lower()
+    if text.startswith("круг"):
+        return True
+    if text.startswith("труба"):
+        return not any(kw in text for kw in _PROFILE_PIPE_KEYWORDS)
+    return False
+
+
+def _clean_material_display(raw_material):
+    """
+    Приводит текст материала к читаемому виду:
+      - "$d" в середине строки меняем на пробел (служебный артефакт
+        формата материала/заготовки в Компасе);
+      - висящий "$" в конце строки просто убираем;
+      - "Без указания материала", "Сталь", "Сталь 10" считаем
+        отсутствием полезной информации — возвращаем пустую строку.
+    """
+    text = _bom_clean(raw_material)
+    if not text:
+        return ""
+    text = text.replace("$d", " ")
+    if text.endswith("$"):
+        text = text[:-1]
+    text = re.sub(r"\s+", " ", text).strip()
+    if text in ("Без указания материала", "Сталь", "Сталь 10"):
+        return ""
+    return text
 
 
 def _group_children(children):
@@ -324,7 +418,8 @@ def collect_bom_rows(part, level=1, rows=None, visited=None, quantity=1, childre
 
     name = _bom_clean(_safe_attr(part, "Name", ""))
     marking = _bom_clean(_safe_attr(part, "Marking", ""))
-    material = _bom_clean(_safe_attr(part, "Material", ""))
+    material = _clean_material_display(_safe_attr(part, "Material", ""))
+    mass = get_mass(part)
 
     rows.append({
         "level": level,
@@ -332,6 +427,7 @@ def collect_bom_rows(part, level=1, rows=None, visited=None, quantity=1, childre
         "Обозначение": marking,
         "Материал": material,
         "Количество": quantity,
+        "Масса": mass,
         "_is_node": bool(children),
         "_total_quantity": total_quantity,
     })
@@ -379,6 +475,7 @@ def build_summary_rows(rows):
                 "Наименование": row["Наименование"],
                 "Материал": row["Материал"],
                 "Количество": 0,
+                "Масса": row.get("Масса"),
                 "_is_node": row["_is_node"],
             }
             order.append(key)
@@ -390,6 +487,72 @@ def build_summary_rows(rows):
         item["Обозначение"].lower(),
         item["Наименование"].lower(),
     ))
+    for item in result:
+        item["Масса общая"] = item["Масса"] * item["Количество"] if item["Масса"] is not None else None
+    return result
+
+
+def build_pki_rows(summary_items):
+    """Позиции без собственного обозначения (ПКИ) — для листа 'Прочие изделия'."""
+    return [
+        item for item in summary_items
+        if not item["_is_node"] and _classify(item["Обозначение"], False) == CATEGORY_PKI
+    ]
+
+
+def build_standard_rows(summary_items):
+    """Стандартные изделия (крепёж и т.п. со ссылкой на ГОСТ/DIN/...) — для листа 'Метиз'."""
+    return [
+        item for item in summary_items
+        if not item["_is_node"] and _classify(item["Обозначение"], False) == CATEGORY_STANDARD
+    ]
+
+
+def build_turning_parts_rows(summary_items):
+    """Собственные детали, изготавливаемые из круглого проката/трубы — для листа 'Токарка'."""
+    return [
+        item for item in summary_items
+        if not item["_is_node"]
+        and _classify(item["Обозначение"], False) == CATEGORY_DETAIL
+        and _is_turning_material(item["Материал"])
+    ]
+
+
+def build_material_rows(summary_items, turning):
+    """
+    Сводка по материалам собственных деталей (без узлов/крепежа/ПКИ):
+    turning=True — материалы для токарной обработки (лист "Токарка
+    материал"), turning=False — все остальные (лист "Металл").
+    Позиции без известного материала (пустое после очистки) в сводку
+    по материалам не попадают — там нечего суммировать.
+    """
+    order = []
+    groups = {}
+    for item in summary_items:
+        if item["_is_node"]:
+            continue
+        if _classify(item["Обозначение"], False) != CATEGORY_DETAIL:
+            continue
+        material = item["Материал"]
+        if not material:
+            continue
+        if _is_turning_material(material) != turning:
+            continue
+        if material not in groups:
+            groups[material] = {"Обозначение": material, "Масса": 0.0, "_has_mass": False}
+            order.append(material)
+        if item["Масса общая"] is not None:
+            groups[material]["Масса"] += item["Масса общая"]
+            groups[material]["_has_mass"] = True
+
+    result = [groups[key] for key in order]
+    result.sort(key=lambda r: r["Обозначение"].lower())
+    for r in result:
+        if r["_has_mass"]:
+            r["Масса+30%"] = r["Масса"] * 1.3
+        else:
+            r["Масса"] = None
+            r["Масса+30%"] = None
     return result
 
 
@@ -412,6 +575,22 @@ BOM_OUTPUT_COLUMNS = [
     ("Количество", "Количество"),
     ("Материал", "Материал"),
 ]
+
+# Столбцы, которые должны попадать в ячейку как настоящее число Excel
+# (а не текст) — чтобы с ними можно было считать/суммировать.
+_NUMERIC_KEYS = {"level", "Количество", "Масса", "Масса+30%", "Масса общая"}
+
+
+def _cell_value(value, key):
+    """Готовит значение к записи в ячейку: число — как есть (округлённое), текст — через _bom_clean."""
+    if key in _NUMERIC_KEYS:
+        if value is None or value == "":
+            return None
+        if isinstance(value, float):
+            return round(value, 3)
+        return value
+    text = _bom_clean(value)
+    return text if text != "" else None
 
 
 def _col_index_to_letters(index):
@@ -682,14 +861,68 @@ SUMMARY_COLUMNS = [
     ("Наименование", "Наименование"),
     ("Количество", "Количество"),
     ("Материал", "Материал"),
+    ("Масса", "Масса"),
+    ("Масса общая", "Масса общая"),
 ]
+
+# "Прочие изделия" / "Гидравлика" / "Метиз" / "Токарка" — списки позиций.
+# "Код 1С ЕРП" и "Артикул" в модели Компаса не хранятся (нет источника
+# данных) — столбцы есть, но всегда пустые.
+ITEMS_COLUMNS = [
+    ("Код 1С ЕРП", None),
+    ("Артикул", None),
+    ("Обозначение", "Обозначение"),
+    ("Наименование", "Наименование"),
+    ("Количество", "Количество"),
+]
+ITEMS_COL_WIDTHS = [15, 15, 20, 55, 12]
+
+# "Металл" / "Токарка материал" — сводки по материалу. "Код 1С ЕРП" —
+# по той же причине всегда пусто.
+MATERIAL_COLUMNS = [
+    ("Код 1С ЕРП", None),
+    ("Обозначение", "Обозначение"),
+    ("Масса", "Масса"),
+    ("Масса+30%", "Масса+30%"),
+]
+MATERIAL_COL_WIDTHS = [15, 30, 12, 14]
+
+
+def _items_to_data_rows(items, columns):
+    """Готовит data_rows для _write_workbook из списка словарей-позиций."""
+    data_rows = []
+    for item in items:
+        cells = [None if key is None else _cell_value(item.get(key), key) for _title, key in columns]
+        data_rows.append({"is_node": item.get("_is_node", False), "cells": cells})
+    return data_rows
+
+
+def _empty_sheet(name):
+    """Полностью пустой лист (для "Аутсорсинг"/"Наклейки" — пока без структуры)."""
+    return {
+        "name": name,
+        "header": [""],
+        "data_rows": [],
+        "name_col_index": 0,
+        "col_widths": [20],
+        "tree_style": False,
+    }
 
 
 def build_structured_workbook_from_rows(rows, output_path):
     """
-    Пишет xlsx с двумя листами: "Состав изделия" (наглядное дерево с
-    отступами и группировкой) и "Сводная ведомость" (плоский список
-    всех позиций по всему изделию, одинаковые — суммированы).
+    Пишет итоговый xlsx с несколькими листами:
+      - "Состав изделия" — наглядное дерево с отступами и группировкой;
+      - "Сводная ведомость" — плоский список всех позиций по всему
+        изделию (одинаковые суммированы), с массой на деталь и общей;
+      - "Прочие изделия" / "Метиз" — позиции без обозначения (ПКИ) и
+        стандартные изделия соответственно;
+      - "Гидравлика" — та же структура, что и "Прочие изделия", но
+        пока без данных (переносить в неё пока нечего);
+      - "Металл" / "Токарка материал" — сводки по материалу для
+        обычных и токарных деталей (масса + масса с запасом 30%);
+      - "Токарка" — детали, изготавливаемые из круглого проката/трубы;
+      - "Аутсорсинг" / "Наклейки" — оставлены пустыми.
     """
     header = [title for title, _ in BOM_OUTPUT_COLUMNS]
     name_col_index = [i for i, (_, key) in enumerate(BOM_OUTPUT_COLUMNS) if key == "Наименование"][0]
@@ -697,27 +930,22 @@ def build_structured_workbook_from_rows(rows, output_path):
     tree_data_rows = []
     for row in rows:
         level = row.get("level", 1)
-        cells = []
-        for _, key in BOM_OUTPUT_COLUMNS:
-            if key == "level":
-                cells.append(level)
-            else:
-                value = _bom_clean(row.get(key, ""))
-                cells.append(value if value != "" else None)
+        cells = [_cell_value(row.get(key), key) for _title, key in BOM_OUTPUT_COLUMNS]
         tree_data_rows.append({"level": level, "is_node": row.get("_is_node", False), "cells": cells})
 
+    summary_items = build_summary_rows(rows)
     summary_header = [title for title, _ in SUMMARY_COLUMNS]
-    summary_data_rows = []
-    for item in build_summary_rows(rows):
-        cells = []
-        for _, key in SUMMARY_COLUMNS:
-            value = item.get(key, "")
-            if key == "Количество":
-                cells.append(value)
-            else:
-                value = _bom_clean(value)
-                cells.append(value if value != "" else None)
-        summary_data_rows.append({"is_node": item.get("_is_node", False), "cells": cells})
+    summary_data_rows = _items_to_data_rows(summary_items, SUMMARY_COLUMNS)
+
+    pki_data_rows = _items_to_data_rows(build_pki_rows(summary_items), ITEMS_COLUMNS)
+    standard_data_rows = _items_to_data_rows(build_standard_rows(summary_items), ITEMS_COLUMNS)
+    turning_parts_data_rows = _items_to_data_rows(build_turning_parts_rows(summary_items), ITEMS_COLUMNS)
+
+    metal_data_rows = _items_to_data_rows(build_material_rows(summary_items, turning=False), MATERIAL_COLUMNS)
+    turning_material_data_rows = _items_to_data_rows(build_material_rows(summary_items, turning=True), MATERIAL_COLUMNS)
+
+    items_header = [title for title, _ in ITEMS_COLUMNS]
+    material_header = [title for title, _ in MATERIAL_COLUMNS]
 
     sheets = [
         {
@@ -733,9 +961,59 @@ def build_structured_workbook_from_rows(rows, output_path):
             "header": summary_header,
             "data_rows": summary_data_rows,
             "name_col_index": 1,
-            "col_widths": [20, 55, 12, 30],
+            "col_widths": [20, 55, 12, 30, 12, 14],
             "tree_style": False,
         },
+        {
+            "name": "Прочие изделия",
+            "header": items_header,
+            "data_rows": pki_data_rows,
+            "name_col_index": 3,
+            "col_widths": ITEMS_COL_WIDTHS,
+            "tree_style": False,
+        },
+        {
+            "name": "Гидравлика",
+            "header": items_header,
+            "data_rows": [],
+            "name_col_index": 3,
+            "col_widths": ITEMS_COL_WIDTHS,
+            "tree_style": False,
+        },
+        {
+            "name": "Метиз",
+            "header": items_header,
+            "data_rows": standard_data_rows,
+            "name_col_index": 3,
+            "col_widths": ITEMS_COL_WIDTHS,
+            "tree_style": False,
+        },
+        {
+            "name": "Металл",
+            "header": material_header,
+            "data_rows": metal_data_rows,
+            "name_col_index": 1,
+            "col_widths": MATERIAL_COL_WIDTHS,
+            "tree_style": False,
+        },
+        {
+            "name": "Токарка материал",
+            "header": material_header,
+            "data_rows": turning_material_data_rows,
+            "name_col_index": 1,
+            "col_widths": MATERIAL_COL_WIDTHS,
+            "tree_style": False,
+        },
+        {
+            "name": "Токарка",
+            "header": items_header,
+            "data_rows": turning_parts_data_rows,
+            "name_col_index": 3,
+            "col_widths": ITEMS_COL_WIDTHS,
+            "tree_style": False,
+        },
+        _empty_sheet("Аутсорсинг"),
+        _empty_sheet("Наклейки"),
     ]
 
     return _write_workbook(output_path, sheets)
