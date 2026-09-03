@@ -1,110 +1,144 @@
 # -*- coding: utf-8 -*-
 """
-Разведочный скрипт: НИЧЕГО не сохраняет и не изменяет — только
-подключается к Компасу и печатает реальные имена свойств/методов
-активного документа и его детали/сборки, чтобы найти правильный вызов
-для меню "Управление -> Отчёты -> Создать отчёт" (и соседних пунктов
-"Создать таблицу исполнений", "Создать отчёт по массиву").
+Разведочный скрипт v2: НИЧЕГО не сохраняет и не изменяет.
 
-Почему так: два предыдущих макроса дважды промахнулись с угаданными
-именами методов (Export/SaveAsToFormat/числовые коды формата), а один
-раз это даже привело к тому, что реальный открытый документ оказался
-переключён на временный файл. Чтобы больше не гадать вслепую, этот
-скрипт использует dir() по объектам, полученным через win32com —
-судя по прошлому выводу консоли ("win32com.gen_py...IKompasDocument
-instance"), pywin32 сгенерировал полноценную обёртку с реальными
-именами (в отличие от "голого" IDispatch, где dir() ничего не покажет).
+Первая разведка показала, что в объектах IKompasDocument/IPart7 (API7)
+нет метода, похожего на команду меню "Управление -> Отчёты -> Создать
+отчёт" — похоже, это чисто UI-команда без прямого COM-метода. Но она же
+показала, что dir() ненадёжен: например, doc.PathName прекрасно
+работает, хотя в dir(doc) его не было. Значит для реальных свойств
+нужно не смотреть dir(), а пробовать их вызвать напрямую (getattr) —
+COM в pywin32 обычно позволяет обращаться и к тому, что не попало в
+статически сгенерированный список.
 
-Запустите этот скрипт в Компасе на активной модели/сборке (для которой
-нужно получить состав изделия) и пришлите весь вывод консоли — по нему
-будет видно точное имя метода/интерфейса для генерации отчёта.
+Зато у IPart7 есть настоящий метод PartsEx — это прямой доступ к
+дочерним деталям/подсборкам верхней детали. План: вместо экспорта
+спецификации/отчёта строить структуру состава изделия напрямую обходом
+дерева сборки через PartsEx — так вообще не нужен ни файл
+спецификации, ни команда "Создать отчёт".
+
+Этот скрипт проверяет:
+  - как из PartsEx получить список дочерних деталей (Count/Item и т.п.);
+  - какие у детали реально работают свойства: Name, обозначение
+    (Marking/Designation/...), количество экземпляров, материал;
+  - работает ли то же самое рекурсивно на дочерней детали (есть ли у
+    неё тоже PartsEx, то есть можно ли идти вглубь).
+
+Запустите на той же сборке верхнего уровня, что и раньше, и пришлите
+весь вывод.
 """
 
 import win32com.client
 
 
-def _print_members(title, obj, keywords=None):
-    print()
-    print("-" * 70)
-    print(title)
-    print("-" * 70)
-    if obj is None:
-        print("  (объект отсутствует)")
-        return
+def _try_attrs(obj, names, label):
+    print("  Проверяем атрибуты объекта [{}]:".format(label))
+    found = {}
+    for name in names:
+        try:
+            value = getattr(obj, name)
+            # Если это метод/COM-объект, а не простое значение — не печатаем целиком.
+            printable = value
+            if callable(value):
+                printable = "<callable>"
+            print("    ✓ {} = {!r}".format(name, printable))
+            found[name] = value
+        except Exception as e:
+            print("    ✗ {} недоступен: {}".format(name, e))
+    return found
 
-    print("  Python-тип объекта: {}".format(type(obj)))
+
+def _try_collection_access(obj, label):
+    print("  Пробуем получить количество элементов и первый элемент [{}]:".format(label))
+    count = None
+    for name in ("Count", "GetCount", "Length"):
+        try:
+            value = getattr(obj, name)
+            count = value() if callable(value) else value
+            print("    ✓ {} -> {}".format(name, count))
+            break
+        except Exception as e:
+            print("    ✗ {} недоступен: {}".format(name, e))
+
+    first_item = None
+    if count:
+        for name in ("Item", "GetItem", "GetPart"):
+            try:
+                method = getattr(obj, name)
+                first_item = method(0)
+                print("    ✓ {}(0) -> {}".format(name, type(first_item)))
+                break
+            except Exception as e:
+                print("    ✗ {}(0) недоступен: {}".format(name, e))
 
     try:
-        members = [m for m in dir(obj) if not m.startswith("_")]
+        print("    Пробуем for-итерацию по объекту напрямую...")
+        items = list(obj)
+        print("    ✓ Итерация сработала, элементов: {}".format(len(items)))
+        if items and first_item is None:
+            first_item = items[0]
     except Exception as e:
-        print("  dir() не сработал: {}".format(e))
-        return
+        print("    ✗ Итерация не сработала: {}".format(e))
 
-    if keywords:
-        filtered = [m for m in members if any(k.lower() in m.lower() for k in keywords)]
-        print("  Всего членов: {}. Из них похожих на {}: {}".format(len(members), keywords, len(filtered)))
-        for m in sorted(filtered):
-            print("    ", m)
-        print("  (полный список ниже)")
+    return count, first_item
 
-    print("  Полный список членов:")
-    for m in sorted(members):
-        print("    ", m)
+
+CANDIDATE_NAMES = [
+    "Name", "Marking", "Designation", "Symbol", "FullMarking",
+    "Material", "MaterialName",
+    "Count", "InstanceCount", "UniqueNum",
+    "Comment", "Note",
+]
 
 
 def main():
     print("=" * 70)
-    print("РАЗВЕДКА API КОМПАСА — ничего не сохраняет и не меняет")
+    print("РАЗВЕДКА API КОМПАСА v2 — структура сборки через PartsEx")
     print("=" * 70)
 
     app = win32com.client.Dispatch("Kompas.Application.7")
-    print("Приложение получено:", type(app))
-
     doc = app.ActiveDocument
-    _print_members("АКТИВНЫЙ ДОКУМЕНТ (doc)", doc, keywords=["report", "спец", "spec", "struct", "compos", "bom"])
+    print("Активный документ:", doc.PathName)
 
+    doc3d = win32com.client.CastTo(doc, "IKompasDocument3D")
+    top_part = doc3d.TopPart
+    print()
+    print("TopPart получен:", type(top_part))
+
+    print()
+    _try_attrs(top_part, CANDIDATE_NAMES, "TopPart")
+
+    print()
+    print("-" * 70)
+    print("top_part.PartsEx")
+    print("-" * 70)
     try:
-        print()
-        print("doc.PathName =", doc.PathName)
-    except Exception as e:
-        print("doc.PathName недоступен:", e)
+        parts_ex = top_part.PartsEx
+        print("Тип parts_ex:", type(parts_ex))
+        count, first_child = _try_collection_access(parts_ex, "PartsEx")
 
-    try:
-        doc7 = win32com.client.CastTo(doc, "IKompasDocument3D")
-        print()
-        print("Успешно приведён к IKompasDocument3D:", type(doc7))
-    except Exception as e:
-        print()
-        print("CastTo(IKompasDocument3D) не сработал:", e)
-        doc7 = None
-
-    top_part = None
-    for attr in ("TopPart",):
-        try:
-            top_part = getattr(doc7 if doc7 else doc, attr)
-            print("{} получен: {}".format(attr, type(top_part)))
-            break
-        except Exception as e:
-            print("{} недоступен: {}".format(attr, e))
-
-    _print_members("ВЕРХНЯЯ ДЕТАЛЬ/СБОРКА (TopPart)", top_part, keywords=["report", "спец", "spec", "struct", "compos", "bom"])
-
-    if top_part is not None:
-        for candidate_attr in ("ReportManager", "Report", "Reports"):
-            try:
-                sub_obj = getattr(top_part, candidate_attr)
-                _print_members("top_part.{}".format(candidate_attr), sub_obj)
-            except Exception as e:
-                print()
-                print("top_part.{} недоступен: {}".format(candidate_attr, e))
-
-    for candidate_attr in ("ReportManager", "Report", "Reports"):
-        try:
-            sub_obj = getattr(doc, candidate_attr)
-            _print_members("doc.{}".format(candidate_attr), sub_obj)
-        except Exception as e:
+        if first_child is not None:
             print()
-            print("doc.{} недоступен: {}".format(candidate_attr, e))
+            print("-" * 70)
+            print("ПЕРВАЯ ДОЧЕРНЯЯ ДЕТАЛЬ/ПОДСБОРКА")
+            print("-" * 70)
+            print("Тип:", type(first_child))
+            _try_attrs(first_child, CANDIDATE_NAMES, "первый child")
+
+            print()
+            print("  Проверяем, есть ли у дочерней детали свой PartsEx (можно ли идти глубже)...")
+            try:
+                child_parts_ex = first_child.PartsEx
+                print("    ✓ У дочерней детали есть PartsEx:", type(child_parts_ex))
+                _try_collection_access(child_parts_ex, "child.PartsEx")
+            except Exception as e:
+                print("    ✗ У дочерней детали нет PartsEx:", e)
+        else:
+            print("Не удалось получить первый дочерний элемент — сборка либо пуста, "
+                  "либо нужен другой способ доступа (пришлите этот вывод).")
+
+    except Exception as e:
+        print("top_part.PartsEx недоступен:", e)
 
     print()
     print("=" * 70)
