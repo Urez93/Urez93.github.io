@@ -1244,6 +1244,55 @@ def report_candidates(planar, thickness_hint, count=6):
             "да" if closed else "НЕТ", pair))
 
 
+def estimate_thickness(planar, count=10):
+    """
+    Толщина по геометрии: наименьшее расстояние между параллельными
+    гранями из числа крупнейших. Нужна, когда деталь не листовая и
+    ISheetMetalBody.Thickness недоступна.
+    """
+    best = None
+    faces = planar[:count]
+    for index, first in enumerate(faces):
+        for second in faces[index + 1:]:
+            if abs(abs(dot(first.normal, second.normal)) - 1.0) > 1e-3:
+                continue
+            distance = abs(dot(sub(second.origin, first.origin), first.normal))
+            if distance < 1e-6:
+                continue
+            if best is None or distance < best:
+                best = distance
+    return best
+
+
+def drop_edge_faces(planar, thickness):
+    """
+    Убирает торцы из кандидатов.
+
+    У торца габарит по одной стороне равен толщине материала. Такие грани
+    развёрткой быть не могут, а мешать выбору способны: торец с недочитанными
+    рёбрами выглядит крупным четырёхугольником.
+    """
+    if not thickness:
+        return planar
+
+    allowed = max(thickness * 0.1, 0.1)
+    kept = []
+    for face in planar:
+        width, height = face_size(face)
+        if abs(min(width, height) - thickness) <= allowed:
+            continue
+        kept.append(face)
+
+    dropped = len(planar) - len(kept)
+    if not kept:
+        warn("все грани похожи на торцы — фильтр по толщине не применён.")
+        return planar
+    if dropped:
+        ok("отсеяно торцов (габарит равен толщине {:.2f} мм): {}".format(
+            thickness, dropped))
+    return kept
+
+
 def opposite_face(face, planar, thickness_hint):
     """
     Грань с обратной стороны листа: параллельная данной и отстоящая от неё
@@ -1332,6 +1381,9 @@ def find_plate_faces(faces, thickness_hint=None):
         return None, None, None
 
     planar.sort(key=lambda item: item.area, reverse=True)
+
+    thickness_hint = thickness_hint or estimate_thickness(planar)
+    planar = drop_edge_faces(planar, thickness_hint)
     report_candidates(planar, thickness_hint)
 
     best, opposite, thickness = choose_plate_face(planar, thickness_hint)
