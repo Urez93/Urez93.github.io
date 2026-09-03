@@ -1,193 +1,268 @@
 # -*- coding: utf-8 -*-
 """
-Макрос для Компас-3D: выгружает состав изделия (спецификацию) из
-активно открытой модели и сохраняет уже СТРУКТУРИРОВАННУЮ таблицу
+Макрос для Компас-3D: выгружает состав изделия из активно открытой
+3D-модели (сборки) и сохраняет наглядную СТРУКТУРИРОВАННУЮ таблицу
 (с отступами по уровням вложенности и группировкой строк) рядом с
 открытым файлом модели — в ту же папку.
 
 Что делает:
   1. Подключается к запущенному Компас-3D и находит активный документ.
-  2. По активному документу определяет папку, где лежит файл модели —
-     туда же будет сохранён результат.
-  3. Находит документ спецификации: либо сам активный документ уже
-     является спецификацией, либо ищет открытую спецификацию среди
-     остальных открытых в Компасе документов.
-  4. Экспортирует спецификацию во временный плоский excel-файл штатным
-     сохранением Компаса и сразу строит из него наглядную
-     структурированную таблицу через kompas_bom_structure.py.
-  5. Сохраняет итоговый файл "<имя_модели>_состав_изделия.xlsx" в папку
-     с открытой моделью, временный плоский файл удаляет.
+  2. Берёт его TopPart (верхнюю деталь/сборку) и рекурсивно обходит
+     дерево состава через IPart7.PartsEx — то есть структуру берёт
+     напрямую из 3D-модели, БЕЗ файла спецификации (.spw) и без каких-
+     либо команд меню.
+  3. Для каждой позиции записывает: уровень вложенности, Наименование
+     (Name), Обозначение (Marking), Материал (Material), Количество
+     (InstanceCount) — единственные свойства детали, подтверждённые
+     разведкой API как реально работающие в этой версии Компаса.
+  4. Строит таблицу с отступами по вложенности и группировкой строк
+     (Excel: можно сворачивать/разворачивать узлы) и сохраняет как
+     "<имя_модели>_состав_изделия.xlsx" в папку с открытой моделью.
+
+ВАЖНОЕ ОГРАНИЧЕНИЕ: раздел спецификации ("Стандартные изделия" /
+"Прочие изделия"), формат листа, позиция по спецификации, обозначение
+стандарта и типоразмер крепежа в дереве 3D-модели не хранятся — эти
+данные есть только в документе спецификации. Здесь их нет.
 
 Требования:
   - pywin32 (win32com) — связь с Компасом. Больше НИЧЕГО стороннего не
-    требуется: чтение и запись .xlsx сделаны на чистой стандартной
-    библиотеке Python (zipfile + xml), потому что во встроенном
-    интерпретаторе Компаса нет pip/openpyxl, и ставить их туда не нужно.
+    требуется: запись .xlsx сделана на чистой стандартной библиотеке
+    Python (zipfile + xml), потому что во встроенном интерпретаторе
+    Компаса нет pip/openpyxl.
 
-Файл полностью самостоятельный (логика построения структуры из
-kompas_bom_structure.py включена сюда же) — это специально сделано,
-потому что встроенный Python в Компасе не всегда видит соседние .py
-файлы через обычный импорт (другая рабочая директория/__file__).
-Для ручной пост-обработки уже сохранённых файлов вне Компаса можно
-по-прежнему пользоваться отдельным kompas_bom_structure.py (он
-использует openpyxl, если он есть в обычном Python на компьютере).
+БЕЗОПАСНОСТЬ: макрос только ЧИТАЕТ свойства объектов модели (Name,
+Marking, Material, InstanceCount, PartsEx) — он ни разу не вызывает
+SaveAs/Export/Save ни на одном документе, поэтому не может случайно
+переключить или испортить открытый у вас файл (в отличие от прежних
+версий, где применялся SaveAs документа спецификации).
 
-ВАЖНО про надёжность:
-  Точные названия свойств/методов COM-объектов и числовые коды формата
-  для экспорта спецификации в Excel могут отличаться между версиями
-  Компас-3D. Поэтому для каждого шага сделано несколько попыток разными
-  способами (как и в остальных макросах в этом репозитории) — в
-  консоли будет видно, какой именно способ сработал, а какой нет. Если
-  ни один из способов экспорта не сработает — пришлите вывод консоли,
-  чтобы подобрать точный вызов для вашей версии Компаса.
+ВАЖНО про надёжность: точное количество и порядок аргументов метода
+PartsEx в разных версиях API Компаса может отличаться, поэтому макрос
+пробует несколько сигнатур вызова по очереди и запоминает первую
+рабочую — в консоли будет видно, какая именно сработала. Если ни одна
+не сработает или числа получатся подозрительными (пусто там, где
+должны быть детали, или наоборот — тысячи строк) — пришлите вывод
+консоли.
 """
 
 import os
-import re
 import zipfile
-from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as _xml_escape
 
 
+def _log(msg):
+    print(msg)
+
+
 # ---------------------------------------------------------------------------
-# Построение структурированной таблицы (та же логика, что в
-# kompas_bom_structure.py, включена сюда, чтобы макрос не зависел от
-# импорта соседнего файла внутри встроенного Python Компаса).
-#
-# Чтение и запись .xlsx реализованы вручную поверх zipfile/xml — во
-# встроенном Python Компаса нет openpyxl/xlrd и обычно нет pip, чтобы их
-# поставить, а .xlsx — это просто zip-архив с XML-файлами внутри.
+# Подключение к Компасу и активному документу
 # ---------------------------------------------------------------------------
 
-BOM_OUTPUT_COLUMNS = [
-    ("Уровень", "level"),
-    ("Позиция", "Позиция"),
-    ("Обозначение", "Обозначение"),
-    ("Наименование", "Наименование"),
-    ("Количество", "Количество"),
-    ("Масса", "Масса"),
-    ("Материал", "Материал"),
-    ("Раздел спецификации", "Раздел спецификации"),
-    ("Форматы листов документа", "Форматы листов документа"),
-    ("Вид изделия", "Вид изделия"),
-    ("Обозначение стандарта", "Обозначение стандарта"),
-    ("Типоразмер", "Типоразмер"),
-    ("Примечание", "Примечание"),
+def connect_kompas():
+    """Подключение к уже запущенному Компас-3D (COM)."""
+    import win32com.client
+
+    last_error = None
+    for prog_id in ("Kompas.Application.7", "Kompas.Application.5", "KOMPAS.Application.5"):
+        try:
+            _log("Подключаемся через {}...".format(prog_id))
+            app = win32com.client.Dispatch(prog_id)
+            _log("  ✓ Подключено через {}".format(prog_id))
+            return app
+        except Exception as e:
+            last_error = e
+            _log("  ✗ Не удалось: {}".format(e))
+
+    raise RuntimeError("Не удалось подключиться к Компас-3D: {}".format(last_error))
+
+
+def get_active_document(app):
+    """Получение активного документа."""
+    try:
+        doc = app.ActiveDocument
+        if doc:
+            return doc
+    except Exception as e:
+        _log("ActiveDocument недоступен: {}".format(e))
+
+    try:
+        docs = app.Documents
+        if docs and docs.Count > 0:
+            return docs.Item(0)
+    except Exception as e:
+        _log("Documents недоступен: {}".format(e))
+
+    raise RuntimeError("Активный документ не найден. Откройте модель/сборку в Компасе.")
+
+
+def get_document_path(doc):
+    """Полный путь к файлу документа — несколько вариантов на случай разных версий API."""
+    for attr in ("PathName", "Path", "FullFileName", "FileName"):
+        try:
+            value = getattr(doc, attr)
+            if value:
+                _log("  Путь получен через {}: {}".format(attr, value))
+                return value
+        except Exception:
+            continue
+    raise RuntimeError(
+        "Не удалось получить путь к файлу активного документа. "
+        "Сохраните файл на диск (он должен иметь путь) и повторите."
+    )
+
+
+def get_top_part(doc):
+    """Верхняя деталь/сборка документа (IPart7) через IKompasDocument3D."""
+    import win32com.client
+
+    try:
+        doc3d = win32com.client.CastTo(doc, "IKompasDocument3D")
+    except Exception as e:
+        raise RuntimeError("Не удалось привести документ к IKompasDocument3D: {}".format(e))
+
+    try:
+        top_part = doc3d.TopPart
+    except Exception as e:
+        raise RuntimeError("Не удалось получить TopPart: {}".format(e))
+
+    if top_part is None:
+        raise RuntimeError("TopPart пуст — похоже, активный документ не является 3D-сборкой/деталью.")
+
+    return top_part
+
+
+# ---------------------------------------------------------------------------
+# Обход дерева состава изделия через IPart7.PartsEx
+# ---------------------------------------------------------------------------
+
+# Предпочтение отдаём (False, False) — по смыслу имён аргументов
+# (bAllPartsInPart, bAllPartsInAssembly) это должно означать "только
+# непосредственные дочерние детали", что и нужно для ручной рекурсии
+# (иначе при "плоском" режиме получим одинаковые данные на каждом
+# уровне рекурсии и задвоим/растиражируем позиции). Остальные варианты
+# — на случай, если в вашей версии API сигнатура иная.
+_PARTSEX_SIGNATURES = [
+    (False, False),
+    (False,),
+    (),
+    (True, False),
+    (False, True),
+    (True, True),
+    (True,),
+    (0, 0),
+    (1,),
 ]
 
-_SS_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-_COL_REF_RE = re.compile(r"([A-Z]+)(\d+)")
+_working_signature = {"sig": None}
 
 
-def _col_letters_to_index(letters):
-    """'A' -> 0, 'B' -> 1, ... 'AA' -> 26 ..."""
-    idx = 0
-    for ch in letters:
-        idx = idx * 26 + (ord(ch) - ord("A") + 1)
-    return idx - 1
-
-
-def _col_index_to_letters(index):
-    """0 -> 'A', 1 -> 'B', ... 26 -> 'AA' ..."""
-    index += 1
-    letters = ""
-    while index > 0:
-        index, remainder = divmod(index - 1, 26)
-        letters = chr(ord("A") + remainder) + letters
-    return letters
-
-
-def _read_xlsx_rows(path):
-    """Читает первый лист .xlsx-файла без сторонних библиотек."""
-    with zipfile.ZipFile(path) as zf:
-        names = zf.namelist()
-
-        shared_strings = []
-        if "xl/sharedStrings.xml" in names:
-            root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
-            for si in root.findall(_SS_NS + "si"):
-                text = "".join(t.text or "" for t in si.iter(_SS_NS + "t"))
-                shared_strings.append(text)
-
-        sheet_candidates = sorted(
-            n for n in names if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
-        )
-        if not sheet_candidates:
-            raise RuntimeError("В файле {} не найден лист с данными.".format(path))
-        sheet_name = "xl/worksheets/sheet1.xml" if "xl/worksheets/sheet1.xml" in sheet_candidates else sheet_candidates[0]
-
-        root = ET.fromstring(zf.read(sheet_name))
-        sheet_data = root.find(_SS_NS + "sheetData")
-
-        rows = []
-        if sheet_data is None:
-            return rows
-
-        for row_el in sheet_data.findall(_SS_NS + "row"):
-            row_values = {}
-            max_col = -1
-            next_col = 0
-            for c_el in row_el.findall(_SS_NS + "c"):
-                ref = c_el.get("r", "")
-                match = _COL_REF_RE.match(ref)
-                col_idx = _col_letters_to_index(match.group(1)) if match else next_col
-                next_col = col_idx + 1
-
-                cell_type = c_el.get("t")
-                value = None
-
-                if cell_type == "s":
-                    v_el = c_el.find(_SS_NS + "v")
-                    if v_el is not None and v_el.text is not None:
-                        value = shared_strings[int(v_el.text)]
-                elif cell_type == "inlineStr":
-                    is_el = c_el.find(_SS_NS + "is")
-                    if is_el is not None:
-                        value = "".join(t.text or "" for t in is_el.iter(_SS_NS + "t"))
-                elif cell_type == "str":
-                    v_el = c_el.find(_SS_NS + "v")
-                    value = v_el.text if v_el is not None else None
-                elif cell_type == "b":
-                    v_el = c_el.find(_SS_NS + "v")
-                    value = bool(int(v_el.text)) if v_el is not None else None
-                else:
-                    v_el = c_el.find(_SS_NS + "v")
-                    if v_el is not None and v_el.text is not None:
-                        text = v_el.text
-                        try:
-                            value = float(text)
-                        except ValueError:
-                            value = text
-
-                row_values[col_idx] = value
-                if col_idx > max_col:
-                    max_col = col_idx
-
-            rows.append([row_values.get(i) for i in range(max_col + 1)])
-        return rows
-
-
-def _read_bom_source_rows(path):
-    """Читает исходную плоскую выгрузку Компаса (.xlsx) построчно, без сторонних библиотек."""
-    ext = os.path.splitext(path)[1].lower()
-    if ext != ".xlsx":
-        raise RuntimeError(
-            "Ожидается временный файл в формате .xlsx, получено: {}. "
-            "Если Компас сохраняет спецификацию только в старом .xls, "
-            "сообщите об этом — потребуется другой способ чтения.".format(ext)
-        )
-
-    all_rows = _read_xlsx_rows(path)
-    if not all_rows:
+def _normalize_parts_result(result):
+    """Приводит результат PartsEx к обычному python-списку."""
+    if result is None:
+        return []
+    if isinstance(result, (list, tuple)):
+        return list(result)
+    # COM-коллекция вида Count/Item(i)
+    try:
+        count = result.Count
+        return [result.Item(i) for i in range(count)]
+    except Exception:
+        pass
+    try:
+        return list(result)
+    except Exception:
         return []
 
-    header = [str(v).strip() if v is not None else "" for v in all_rows[0]]
-    rows = []
-    for values in all_rows[1:]:
-        if not any(v not in (None, "") for v in values):
+
+def get_child_parts(part):
+    """
+    Возвращает непосредственные дочерние детали/подсборки данной детали
+    через PartsEx, перебирая рабочие сигнатуры вызова (см. выше) и
+    запоминая первую удачную для последующих вызовов.
+    """
+    sig = _working_signature["sig"]
+    if sig is not None:
+        try:
+            return _normalize_parts_result(part.PartsEx(*sig))
+        except Exception as e:
+            _log("  Запомненная сигнатура PartsEx{} перестала работать: {} — подбираем заново.".format(sig, e))
+            _working_signature["sig"] = None
+
+    for sig in _PARTSEX_SIGNATURES:
+        try:
+            result = part.PartsEx(*sig)
+            normalized = _normalize_parts_result(result)
+            _working_signature["sig"] = sig
+            _log("  ✓ Рабочая сигнатура PartsEx{}, дочерних элементов: {}".format(sig, len(normalized)))
+            return normalized
+        except Exception:
             continue
-        row = dict(zip(header, values))
-        rows.append(row)
+
+    _log("  ✗ Ни одна сигнатура PartsEx не сработала для этой детали.")
+    return []
+
+
+def _safe_attr(obj, name, default=""):
+    try:
+        value = getattr(obj, name)
+        if callable(value):
+            value = value()
+        return value
+    except Exception:
+        return default
+
+
+MAX_DEPTH = 15
+MAX_ROWS = 2000
+
+
+def collect_bom_rows(part, level=1, rows=None, visited=None):
+    """Рекурсивно собирает строки состава изделия из дерева PartsEx."""
+    if rows is None:
+        rows = []
+    if visited is None:
+        visited = set()
+
+    unique_num = _safe_attr(part, "UniqueNum", None)
+    if unique_num is not None:
+        if unique_num in visited:
+            _log("  Пропускаем повтор (защита от циклов), UniqueNum={}".format(unique_num))
+            return rows
+        visited.add(unique_num)
+
+    name = _bom_clean(_safe_attr(part, "Name", ""))
+    marking = _bom_clean(_safe_attr(part, "Marking", ""))
+    material = _bom_clean(_safe_attr(part, "Material", ""))
+    instance_count = _safe_attr(part, "InstanceCount", None)
+
+    rows.append({
+        "level": level,
+        "Наименование": name,
+        "Обозначение": marking,
+        "Материал": material,
+        "Количество": instance_count,
+    })
+
+    if len(rows) >= MAX_ROWS:
+        _log("  ! Достигнут предел в {} строк — останавливаем обход (защита от зацикливания).".format(MAX_ROWS))
+        return rows
+
+    if level >= MAX_DEPTH:
+        _log("  ! Достигнута максимальная глубина {} — дальше не углубляемся.".format(MAX_DEPTH))
+        return rows
+
+    for child in get_child_parts(part):
+        collect_bom_rows(child, level + 1, rows, visited)
+
+    return rows
+
+
+def _build_tree_flags(rows):
+    """Помечает строки, у которых есть дочерние (для стиля 'узел')."""
+    for i, row in enumerate(rows):
+        level = row["level"]
+        is_node = i + 1 < len(rows) and rows[i + 1]["level"] > level
+        row["_is_node"] = is_node
     return rows
 
 
@@ -199,26 +274,27 @@ def _bom_clean(value):
     return str(value).strip()
 
 
-def _bom_level_from_n(n_value):
-    """Уровень вложенности по коду вида '1.2.3' -> 3. Пустой/битый код -> 1."""
-    text = _bom_clean(n_value)
-    if not text:
-        return 1
-    return text.count(".") + 1
+# ---------------------------------------------------------------------------
+# Запись .xlsx без сторонних библиотек (zipfile + xml)
+# ---------------------------------------------------------------------------
+
+BOM_OUTPUT_COLUMNS = [
+    ("Уровень", "level"),
+    ("Наименование", "Наименование"),
+    ("Обозначение", "Обозначение"),
+    ("Материал", "Материал"),
+    ("Количество", "Количество"),
+]
 
 
-def _build_bom_tree_rows(source_rows):
-    """Дополняет строки уровнем вложенности и признаком 'это узел (есть дети)'."""
-    codes = [_bom_clean(r.get("N")) for r in source_rows]
-
-    for row, code in zip(source_rows, codes):
-        row["level"] = _bom_level_from_n(code)
-        row["_code"] = code
-        row["_is_node"] = any(
-            other and other != code and other.startswith(code + ".")
-            for other in codes
-        )
-    return source_rows
+def _col_index_to_letters(index):
+    """0 -> 'A', 1 -> 'B', ... 26 -> 'AA' ..."""
+    index += 1
+    letters = ""
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
 
 
 class _StyleRegistry(object):
@@ -357,7 +433,7 @@ def _write_xlsx(output_path, header, data_rows, name_col_index):
     last_col_letters = _col_index_to_letters(ncols - 1)
     dimension_ref = "A1:{}{}".format(last_col_letters, last_row_num)
 
-    col_widths = [10, 10, 20, 55, 10, 10, 30, 20, 12, 20, 22, 22, 25]
+    col_widths = [10, 55, 20, 30, 12]
     cols_xml = "".join(
         '<col min="{0}" max="{0}" width="{1}" customWidth="1"/>'.format(
             i + 1, col_widths[i] if i < len(col_widths) else 15
@@ -436,10 +512,9 @@ def _write_xlsx(output_path, header, data_rows, name_col_index):
     return output_path
 
 
-def build_structured_workbook(source_path, output_path):
-    """Читает плоскую выгрузку Компаса и сохраняет наглядный xlsx с деревом (без сторонних библиотек)."""
-    rows = _read_bom_source_rows(source_path)
-    rows = _build_bom_tree_rows(rows)
+def build_structured_workbook_from_rows(rows, output_path):
+    """Пишет наглядный xlsx с деревом прямо из уже собранных строк состава изделия."""
+    rows = _build_tree_flags(rows)
 
     header = [title for title, _ in BOM_OUTPUT_COLUMNS]
     name_col_index = [i for i, (_, key) in enumerate(BOM_OUTPUT_COLUMNS) if key == "Наименование"][0]
@@ -459,213 +534,9 @@ def build_structured_workbook(source_path, output_path):
     return _write_xlsx(output_path, header, data_rows, name_col_index)
 
 
-def _log(msg):
-    print(msg)
-
-
-def connect_kompas():
-    """Подключение к уже запущенному Компас-3D (COM)."""
-    import win32com.client
-
-    last_error = None
-    for prog_id in ("Kompas.Application.7", "Kompas.Application.5", "KOMPAS.Application.5"):
-        try:
-            _log("Подключаемся через {}...".format(prog_id))
-            app = win32com.client.Dispatch(prog_id)
-            _log("  ✓ Подключено через {}".format(prog_id))
-            return app
-        except Exception as e:
-            last_error = e
-            _log("  ✗ Не удалось: {}".format(e))
-
-    raise RuntimeError("Не удалось подключиться к Компас-3D: {}".format(last_error))
-
-
-def get_active_document(app):
-    """Получение активного документа."""
-    try:
-        doc = app.ActiveDocument
-        if doc:
-            return doc
-    except Exception as e:
-        _log("ActiveDocument недоступен: {}".format(e))
-
-    try:
-        docs = app.Documents
-        if docs and docs.Count > 0:
-            return docs.Item(0)
-    except Exception as e:
-        _log("Documents недоступен: {}".format(e))
-
-    raise RuntimeError("Активный документ не найден. Откройте модель/сборку в Компасе.")
-
-
-def get_document_path(doc):
-    """Полный путь к файлу документа — несколько вариантов на случай разных версий API."""
-    for attr in ("PathName", "Path", "FullFileName", "FileName"):
-        try:
-            value = getattr(doc, attr)
-            if value:
-                _log("  Путь получен через {}: {}".format(attr, value))
-                return value
-        except Exception:
-            continue
-    raise RuntimeError(
-        "Не удалось получить путь к файлу активного документа. "
-        "Сохраните файл на диск (он должен иметь путь) и повторите."
-    )
-
-
-SPECIFICATION_EXTENSION = ".spw"
-
-
-def find_specification_path(app, model_path):
-    """
-    Определяет путь к файлу спецификации (.spw), связанному с активной моделью.
-
-    Числовой код DocumentType в разных версиях API Компаса нестабилен
-    (на практике встретился случай, когда открытый документ .a3d — 3D-модель,
-    а не спецификация — давал DocumentType, совпадающий с ожидаемым кодом
-    спецификации). Поэтому вместо угадывания числового кода определяем
-    спецификацию по расширению файла ".spw" — это стандартное и стабильное
-    соглашение об именовании в Компасе.
-    """
-    if model_path.lower().endswith(SPECIFICATION_EXTENSION):
-        _log("Активный документ уже является спецификацией (.spw).")
-        return model_path
-
-    try:
-        docs = app.Documents
-        for i in range(docs.Count):
-            d = docs.Item(i)
-            try:
-                path = get_document_path(d)
-            except Exception:
-                continue
-            if path.lower().endswith(SPECIFICATION_EXTENSION):
-                _log("Найдена открытая спецификация: {}".format(path))
-                return path
-    except Exception as e:
-        _log("Не удалось перебрать открытые документы: {}".format(e))
-
-    folder = os.path.dirname(model_path)
-    base_name = os.path.splitext(os.path.basename(model_path))[0]
-    candidate = os.path.join(folder, base_name + SPECIFICATION_EXTENSION)
-    if os.path.exists(candidate):
-        _log("Найден файл спецификации рядом с моделью (не был открыт): {}".format(candidate))
-        return candidate
-
-    return None
-
-
-def _looks_like_leftover_temp_name(path):
-    """Похоже ли имя файла на след прошлого (некорректного) запуска макроса."""
-    name = os.path.basename(path)
-    return "_temp_export" in name or name.startswith("~")
-
-
-def export_specification_to_flat_file(doc, temp_path):
-    """
-    Экспортирует документ (спецификацию) в excel-файл. ВАЖНО: вызывается
-    только на ОДНОРАЗОВОЙ копии документа (см. export_specification_safely),
-    а не на реальном открытом у пользователя документе — иначе SaveAs
-    переключает сам открытый документ на новый файл, как обычное
-    "Сохранить как", и активная спецификация в Компасе оказывается
-    переименована в этот временный файл.
-    """
-    attempts = [
-        ("Export(путь, 47)", lambda: doc.Export(temp_path, 47)),
-        ("SaveAsToFormat(путь)", lambda: doc.SaveAsToFormat(temp_path)),
-        ("SaveAs(путь, 47)", lambda: doc.SaveAs(temp_path, 47)),
-        ("SaveAs(путь)", lambda: doc.SaveAs(temp_path)),
-    ]
-
-    for name, action in attempts:
-        try:
-            _log("  Попытка экспорта: {}...".format(name))
-            action()
-            if os.path.exists(temp_path):
-                _log("  ✓ Экспорт удался: {}".format(name))
-                return True
-        except Exception as e:
-            _log("  ✗ {} не удалась: {}".format(name, e))
-
-    return False
-
-
-def _close_document_without_saving(doc):
-    """Закрывает служебную копию документа, не сохраняя изменения (несколько вариантов вызова)."""
-    for name, action in (
-        ("Close(0)", lambda: doc.Close(0)),
-        ("Close(False)", lambda: doc.Close(False)),
-        ("Close()", lambda: doc.Close()),
-    ):
-        try:
-            action()
-            _log("  ✓ Служебная копия закрыта: {}".format(name))
-            return True
-        except Exception as e:
-            _log("  ✗ {} не удалась: {}".format(name, e))
-    return False
-
-
-def export_specification_safely(app, spec_path, temp_flat_path):
-    """
-    Безопасно экспортирует спецификацию в excel, НЕ трогая документ,
-    открытый у пользователя: делает файловую копию исходного файла
-    спецификации под другим именем, открывает копию отдельным
-    документом, экспортирует её и закрывает — реальный открытый
-    документ (если он вообще был открыт) вообще не участвует в
-    SaveAs/Export.
-    """
-    import shutil
-
-    if _looks_like_leftover_temp_name(spec_path):
-        raise RuntimeError(
-            "Открытый документ спецификации сейчас указывает на временный файл "
-            "({}) — похоже, это след прошлого неудачного запуска макроса. "
-            "Закройте этот документ в Компасе БЕЗ сохранения и заново откройте "
-            "настоящий файл спецификации, затем запустите макрос ещё раз.".format(spec_path)
-        )
-
-    folder = os.path.dirname(spec_path)
-    ext = os.path.splitext(spec_path)[1] or ".spw"
-    temp_native_copy = os.path.join(folder, "~bom_export_copy{}".format(ext))
-
-    _log("Копируем файл спецификации для безопасного экспорта...")
-    _log("  {} -> {}".format(spec_path, temp_native_copy))
-    shutil.copy2(spec_path, temp_native_copy)
-
-    copy_doc = None
-    try:
-        for name, action in (
-            ("Documents.Open(путь, False)", lambda: app.Documents.Open(temp_native_copy, False)),
-            ("Documents.Open(путь)", lambda: app.Documents.Open(temp_native_copy)),
-        ):
-            try:
-                _log("  Попытка открыть копию: {}...".format(name))
-                copy_doc = action()
-                if copy_doc:
-                    _log("  ✓ Копия открыта: {}".format(name))
-                    break
-            except Exception as e:
-                _log("  ✗ {} не удалась: {}".format(name, e))
-
-        if copy_doc is None:
-            raise RuntimeError("Не удалось открыть временную копию спецификации для экспорта.")
-
-        ok = export_specification_to_flat_file(copy_doc, temp_flat_path)
-        return ok
-
-    finally:
-        if copy_doc is not None:
-            _close_document_without_saving(copy_doc)
-        try:
-            if os.path.exists(temp_native_copy):
-                os.remove(temp_native_copy)
-        except Exception as e:
-            _log("Не удалось удалить временную копию {}: {}".format(temp_native_copy, e))
-
+# ---------------------------------------------------------------------------
+# Основной сценарий
+# ---------------------------------------------------------------------------
 
 def run_macro():
     print()
@@ -681,54 +552,31 @@ def run_macro():
         print()
         _log("Определяем папку активной модели...")
         model_path = get_document_path(active_doc)
-        if _looks_like_leftover_temp_name(model_path):
-            raise RuntimeError(
-                "Активный документ сейчас указывает на временный файл ({}) — "
-                "похоже, это след прошлого неудачного запуска макроса. Закройте "
-                "его в Компасе БЕЗ сохранения, заново откройте настоящий файл "
-                "модели/спецификации и запустите макрос ещё раз.".format(model_path)
-            )
         folder = os.path.dirname(model_path)
         base_name = os.path.splitext(os.path.basename(model_path))[0]
 
         print()
-        _log("Ищем файл спецификации (.spw)...")
-        spec_path = find_specification_path(app, model_path)
-        if spec_path is None:
-            raise RuntimeError(
-                "Файл спецификации (.spw) не найден: ни активный документ, ни "
-                "другие открытые документы, ни файлы рядом с моделью на диске "
-                "не являются спецификацией. Откройте спецификацию сборки в "
-                "Компасе или убедитесь, что файл '<имя модели>.spw' лежит в "
-                "той же папке, и запустите макрос ещё раз."
-            )
+        _log("Получаем верхнюю деталь (TopPart)...")
+        top_part = get_top_part(active_doc)
+        top_name = _safe_attr(top_part, "Name", "?")
+        _log("  Верхняя деталь: {}".format(top_name))
 
-        temp_flat_path = os.path.join(folder, "~{}_temp_export.xlsx".format(base_name))
+        print()
+        _log("Обходим дерево состава изделия (PartsEx)...")
+        rows = collect_bom_rows(top_part)
+        _log("Собрано строк: {}".format(len(rows)))
+
         output_path = os.path.join(folder, "{}_состав_изделия.xlsx".format(base_name))
 
         print()
-        _log("Экспортируем спецификацию во временный файл (через отдельную копию, не трогая открытый документ)...")
-        ok = export_specification_safely(app, spec_path, temp_flat_path)
-        if not ok:
-            raise RuntimeError(
-                "Не удалось экспортировать спецификацию автоматически. "
-                "Сохраните её вручную через меню Компаса (Файл -> Сохранить как -> MS Excel) "
-                "и запустите kompas_bom_structure.py на полученном файле."
-            )
-
-        print()
         _log("Строим структурированную таблицу...")
-        build_structured_workbook(temp_flat_path, output_path)
-
-        try:
-            os.remove(temp_flat_path)
-        except Exception as e:
-            _log("Не удалось удалить временный файл {}: {}".format(temp_flat_path, e))
+        build_structured_workbook_from_rows(rows, output_path)
 
         print()
         print("=" * 70)
         print("✓ ГОТОВО")
         print("Файл сохранён: {}".format(output_path))
+        print("Всего строк: {}".format(len(rows)))
         print("=" * 70)
         print()
 
