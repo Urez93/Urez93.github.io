@@ -12,9 +12,13 @@
      напрямую из 3D-модели, БЕЗ файла спецификации (.spw) и без каких-
      либо команд меню.
   3. Для каждой позиции записывает: уровень вложенности, Наименование
-     (Name), Обозначение (Marking), Материал (Material), Количество
-     (InstanceCount) — единственные свойства детали, подтверждённые
-     разведкой API как реально работающие в этой версии Компаса.
+     (Name), Обозначение (Marking), Материал (Material) — свойства
+     детали, подтверждённые разведкой API как реально работающие в
+     этой версии Компаса. Количество считается САМИ: сколько раз
+     одинаковая деталь (по обозначению+наименованию+материалу)
+     встречается среди прямых потомков одного узла — метод
+     InstanceCount оказался методом с неясной сигнатурой аргументов,
+     вызов которого не срабатывал и оставлял столбец пустым.
   4. Строит таблицу с отступами по вложенности и группировкой строк
      (Excel: можно сворачивать/разворачивать узлы) и сохраняет как
      "<имя_модели>_состав_изделия.xlsx" в папку с открытой моделью.
@@ -31,7 +35,7 @@
     Компаса нет pip/openpyxl.
 
 БЕЗОПАСНОСТЬ: макрос только ЧИТАЕТ свойства объектов модели (Name,
-Marking, Material, InstanceCount, PartsEx) — он ни разу не вызывает
+Marking, Material, PartsEx) — он ни разу не вызывает
 SaveAs/Export/Save ни на одном документе, поэтому не может случайно
 переключить или испортить открытый у вас файл (в отличие от прежних
 версий, где применялся SaveAs документа спецификации).
@@ -216,7 +220,37 @@ MAX_DEPTH = 15
 MAX_ROWS = 2000
 
 
-def collect_bom_rows(part, level=1, rows=None, visited=None):
+def _group_key(child):
+    """
+    Ключ группировки одинаковых деталей среди прямых потомков одного узла:
+    обозначение + наименование + материал. Используется вместо InstanceCount
+    (тоже метод с неясной сигнатурой аргументов, вызов которого не
+    срабатывал и оставлял столбец "Количество" пустым) — количество
+    считаем сами: сколько раз одна и та же деталь встречается среди
+    прямых потомков. Это и есть локальное количество "в этом узле",
+    которое и нужно в спецификации (например, "Втулка ... Количество: 2"
+    одной строкой, а не двумя одинаковыми строками).
+    """
+    marking = _bom_clean(_safe_attr(child, "Marking", ""))
+    name = _bom_clean(_safe_attr(child, "Name", ""))
+    material = _bom_clean(_safe_attr(child, "Material", ""))
+    return (marking, name, material)
+
+
+def _group_children(children):
+    """Группирует список деталей по _group_key, возвращает [(представитель, количество), ...]."""
+    order = []
+    groups = {}
+    for child in children:
+        key = _group_key(child)
+        if key not in groups:
+            groups[key] = {"representative": child, "count": 0}
+            order.append(key)
+        groups[key]["count"] += 1
+    return [(groups[key]["representative"], groups[key]["count"]) for key in order]
+
+
+def collect_bom_rows(part, level=1, rows=None, visited=None, quantity=1):
     """Рекурсивно собирает строки состава изделия из дерева PartsEx."""
     if rows is None:
         rows = []
@@ -233,14 +267,13 @@ def collect_bom_rows(part, level=1, rows=None, visited=None):
     name = _bom_clean(_safe_attr(part, "Name", ""))
     marking = _bom_clean(_safe_attr(part, "Marking", ""))
     material = _bom_clean(_safe_attr(part, "Material", ""))
-    instance_count = _safe_attr(part, "InstanceCount", None)
 
     rows.append({
         "level": level,
         "Наименование": name,
         "Обозначение": marking,
         "Материал": material,
-        "Количество": instance_count,
+        "Количество": quantity,
     })
 
     if len(rows) >= MAX_ROWS:
@@ -251,8 +284,9 @@ def collect_bom_rows(part, level=1, rows=None, visited=None):
         _log("  ! Достигнута максимальная глубина {} — дальше не углубляемся.".format(MAX_DEPTH))
         return rows
 
-    for child in get_child_parts(part):
-        collect_bom_rows(child, level + 1, rows, visited)
+    children = get_child_parts(part)
+    for representative, count in _group_children(children):
+        collect_bom_rows(representative, level + 1, rows, visited, quantity=count)
 
     return rows
 
