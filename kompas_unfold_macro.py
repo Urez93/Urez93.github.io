@@ -53,6 +53,8 @@ CONFIG = {
     # Геометрия
     "tolerance": 0.02,            # точность аппроксимации кривых, мм
     "arc_tolerance": 0.01,        # допуск при распознавании дуг и окружностей
+    "arc_step_limit": 30.0,       # макс. шаг точек дуги по углу, град
+    "curve_samples": 64,          # точек на ребро при чтении кривой
     "plane_tolerance": 0.05,      # допуск на плоскостность грани, мм
     "weld_tolerance": 0.05,       # допуск на стыковку рёбер в контур, мм
     "min_segment": 1e-4,          # короче этого сегменты выбрасываются, мм
@@ -1097,11 +1099,13 @@ def edge_vertices(edge):
     return None
 
 
-def edge_polyline(edge, samples=64):
+def edge_polyline(edge, samples=None):
     """
     Ребро как ломаная в 3D. Кривые аппроксимируются точками, прямые
     остаются двумя точками. Возвращает список точек или None.
     """
+    if samples is None:
+        samples = CONFIG["curve_samples"]
     ends = edge_vertices(edge)
     points = curve_points(curve_of(edge), samples, ends)
     if points:
@@ -1138,6 +1142,7 @@ class PlanarFace(object):
         self.source = None        # исходный IFace, если нужен самому КОМПАСу
         self.extent = None        # габарит всей детали поперёк этой грани
         self.edges = []           # рёбра грани до сшивки — нужны для склейки
+        self.chunks = []          # контуры как списки рёбер, с их границами
 
 
 def fit_plane(points):
@@ -1177,43 +1182,63 @@ def plane_residual(points, center, normal):
     return max(abs(dot(sub(point, center), normal)) for point in points)
 
 
-def build_loops(polylines):
-    """
-    Сшивает ломаные рёбер в замкнутые контуры по совпадению концов.
-    Возвращает список списков 3D-точек.
-    """
-    chains = [points for points in polylines if points and len(points) >= 2]
-    if not chains:
-        return []
+def loop_is_closed(loop, tolerance):
+    """Замкнут ли контур, собранный из рёбер."""
+    if norm(sub(loop[0][0], loop[-1][-1])) > tolerance:
+        return False
+    return len(loop) > 1 or len(loop[0]) > 2
 
+
+def chain_edges(polylines):
+    """
+    Сшивает рёбра в контуры по совпадению концов, СОХРАНЯЯ границы рёбер:
+    контур остаётся списком рёбер, а не сплошной ломаной.
+
+    Границы важны при разборе на примитивы: одно ребро — одна кривая, и
+    разбор внутри ребра не может залезть на соседнее. Иначе у касательного
+    сопряжения отрезок съедает начало дуги, и размеры уходят на сотые.
+    """
     tolerance = CONFIG["weld_tolerance"]
+    pending = [list(points) for points in polylines
+               if points and len(points) >= 2]
     loops = []
-    pending = list(chains)
-
-    def closed(chain):
-        return len(chain) > 2 and norm(sub(chain[0], chain[-1])) <= tolerance
 
     while pending:
-        loop = pending.pop(0)
-        changed = True
-        while changed and pending and not closed(loop):
-            changed = False
+        loop = [pending.pop(0)]
+        while pending and not loop_is_closed(loop, tolerance):
+            head, tail = loop[0][0], loop[-1][-1]
             for index, chain in enumerate(pending):
-                if norm(sub(loop[-1], chain[0])) <= tolerance:
-                    loop = loop + chain[1:]
-                elif norm(sub(loop[-1], chain[-1])) <= tolerance:
-                    loop = loop + list(reversed(chain))[1:]
-                elif norm(sub(loop[0], chain[-1])) <= tolerance:
-                    loop = chain[:-1] + loop
-                elif norm(sub(loop[0], chain[0])) <= tolerance:
-                    loop = list(reversed(chain))[:-1] + loop
+                if norm(sub(tail, chain[0])) <= tolerance:
+                    loop.append(chain)
+                elif norm(sub(tail, chain[-1])) <= tolerance:
+                    loop.append(list(reversed(chain)))
+                elif norm(sub(head, chain[-1])) <= tolerance:
+                    loop.insert(0, chain)
+                elif norm(sub(head, chain[0])) <= tolerance:
+                    loop.insert(0, list(reversed(chain)))
                 else:
                     continue
                 pending.pop(index)
-                changed = True
+                break
+            else:
                 break
         loops.append(loop)
     return loops
+
+
+def loop_points(loop):
+    """Контур из рёбер -> сплошная ломаная без дублей на стыках."""
+    points = []
+    for chunk in loop:
+        for point in chunk:
+            if not points or norm(sub(point, points[-1])) > CONFIG["min_segment"]:
+                points.append(point)
+    return points
+
+
+def build_loops(polylines):
+    """Сшивает рёбра в замкнутые контуры. Возвращает списки 3D-точек."""
+    return [loop_points(loop) for loop in chain_edges(polylines)]
 
 
 def polygon_area_2d(points):
@@ -1427,7 +1452,7 @@ def merge_group(group):
     if shared:
         ok("склеено граней: {}, погашено рёбер по линиям гиба: {}".format(
             len(group.faces), len(shared)))
-    return build_loops(outline), shared
+    return chain_edges(outline), shared
 
 
 def report_model_size(points):
@@ -1636,12 +1661,14 @@ def find_plate_faces(faces, thickness_hint=None):
     # толщине листа, у согнутой — заметно больше.
     ok("габарит поперёк грани: {:.2f} мм".format(best.extent))
 
-    loops, bends = merge_group(best)
-    if not loops:
+    chunks, bends = merge_group(best)
+    if not chunks:
         err("контур заготовки собрать не удалось.")
         return None, None, None, []
 
+    loops = [loop_points(loop) for loop in chunks]
     result = PlanarFace(loops, best.origin, best.normal, best.area)
+    result.chunks = chunks
     result.extent = best.extent
     result.source = best.faces[0].source
     ok("контуров заготовки: {}, габарит {}".format(len(loops), size_text(result)))
@@ -1671,16 +1698,28 @@ def flatten(face, extra=None):
                 result.append(flat)
         return result
 
-    loops = to_plane(face.loops)
+    source = face.chunks or [[loop] for loop in face.loops]
+    chunks = [to_plane(loop) for loop in source]
+    chunks = [loop for loop in chunks if loop]
     extras = to_plane(extra or [])
 
-    if CONFIG["zero_origin"] and loops:
-        min_x = min(x for loop in loops for x, _ in loop)
-        min_y = min(y for loop in loops for _, y in loop)
-        shift = lambda chains: [[(x - min_x, y - min_y) for x, y in chain]
-                                for chain in chains]
-        loops, extras = shift(loops), shift(extras)
-    return loops, extras
+    if CONFIG["zero_origin"] and chunks:
+        points = [point for loop in chunks for chain in loop for point in chain]
+        min_x = min(x for x, _ in points)
+        min_y = min(y for _, y in points)
+        move = lambda chain: [(x - min_x, y - min_y) for x, y in chain]
+        chunks = [[move(chain) for chain in loop] for loop in chunks]
+        extras = [move(chain) for chain in extras]
+
+    loops = []
+    for loop in chunks:
+        points = []
+        for chain in loop:
+            for point in chain:
+                if not points or distance_2d(point, points[-1]) > CONFIG["min_segment"]:
+                    points.append(point)
+        loops.append(points)
+    return loops, chunks, extras
 
 
 def point_line_distance(point, start, finish):
@@ -1740,11 +1779,20 @@ def on_circle(points, centre, radius, tolerance):
     for point in points:
         if abs(distance_2d(point, centre) - radius) > tolerance:
             return False
-    for index in range(len(points) - 1):
-        middle = ((points[index][0] + points[index + 1][0]) / 2.0,
-                  (points[index][1] + points[index + 1][1]) / 2.0)
-        if abs(distance_2d(middle, centre) - radius) > tolerance * 10.0:
-            return False
+
+    # Отличие дуги от прямоугольника не в отклонении от окружности, а в
+    # частоте точек: ломаная дуги идёт по окружности мелкими шагами, а углы
+    # прямоугольника разнесены на десятки градусов. Признак безразмерный,
+    # поэтому одинаково работает и для мелких, и для крупных отверстий.
+    limit = math.radians(CONFIG["arc_step_limit"])
+    previous = None
+    for point in points:
+        angle = math.atan2(point[1] - centre[1], point[0] - centre[0])
+        if previous is not None:
+            step = abs((angle - previous + math.pi) % (2.0 * math.pi) - math.pi)
+            if step > limit:
+                return False
+        previous = angle
     return True
 
 
@@ -2075,7 +2123,25 @@ def fmt(value):
     return "{:.6f}".format(float(value))
 
 
-def write_dxf(path, loops, article, bend_lines=None):
+def loop_primitives(loop, chunks, closed):
+    """
+    Примитивы контура.
+
+    Целая окружность распознаётся по контуру целиком — отверстие в модели
+    часто состоит из двух полуокружностей. Всё остальное разбирается по
+    рёбрам: одно ребро — одна кривая, и разбор не залезает на соседнее.
+    """
+    whole = contour_segments(loop, closed)
+    if len(whole) == 1 and whole[0][0] == "circle":
+        return whole
+
+    primitives = []
+    for chain in chunks:
+        primitives.extend(contour_segments(chain, False))
+    return primitives or whole
+
+
+def write_dxf(path, loops, chunks, article, bend_lines=None):
     """Пишет контуры реза, при необходимости линии гиба и артикул."""
     step("Запись DXF")
 
@@ -2084,11 +2150,11 @@ def write_dxf(path, loops, article, bend_lines=None):
     open_loops = 0
 
     counts = {"line": 0, "arc": 0, "circle": 0}
-    for loop in loops:
+    for loop, loop_chunks in zip(loops, chunks):
         closed = is_closed(loop)
         if not closed:
             open_loops += 1
-        primitives = contour_segments(loop, closed)
+        primitives = loop_primitives(loop, loop_chunks, closed)
         for item in primitives:
             counts[item[0]] += 1
         writer.segments(cut_layer, primitives)
@@ -2315,7 +2381,7 @@ def export_active_part(application):
         if not check_flat(part, thickness, extent):
             return False
 
-        loops, bend_lines = flatten(face, bends)
+        loops, chunks, bend_lines = flatten(face, bends)
         if not loops:
             err("контуры грани не получены.")
             return False
@@ -2328,7 +2394,7 @@ def export_active_part(application):
             err("файл уже существует: {}".format(output))
             return False
 
-        write_dxf(output, loops, get_article(part, path), bend_lines)
+        write_dxf(output, loops, chunks, get_article(part, path), bend_lines)
         return True
     finally:
         if restore is not None:
