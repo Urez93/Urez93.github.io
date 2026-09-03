@@ -889,13 +889,20 @@ def curve_of(edge):
 
 
 def point_tuple(value):
-    """Приводит результат COM-вызова к (x, y, z)."""
+    """
+    Приводит результат COM-вызова к (x, y, z).
+
+    Координаты в API5 возвращаются через выходные параметры, поэтому
+    pywin32 отдаёт кортеж (признак_успеха, x, y, z) — четыре значения.
+    Брать нужно ТРИ ПОСЛЕДНИХ: первые числа — возвращаемое значение метода.
+    """
     if value is None:
         return None
     if isinstance(value, (list, tuple)):
-        numbers = [v for v in value if isinstance(v, (int, float))]
+        numbers = [v for v in value
+                   if isinstance(v, (int, float)) and not isinstance(v, bool)]
         if len(numbers) >= 3:
-            return (float(numbers[0]), float(numbers[1]), float(numbers[2]))
+            return tuple(float(v) for v in numbers[-3:])
         return None
     coords = []
     for axis in ("X", "Y", "Z"):
@@ -1320,6 +1327,23 @@ def estimate_thickness(planar, count=10):
     return best
 
 
+def report_model_size(points):
+    """
+    Габарит прочитанной геометрии.
+
+    Строка нужна как проверка самого чтения: у объёмной детали все три
+    измерения ненулевые. Ноль означает, что координаты читаются неверно и
+    геометрия схлопнулась в плоскость — тогда любой выбор грани бессмыслен.
+    """
+    if not points:
+        return
+    sizes = [max(point[axis] for point in points) -
+             min(point[axis] for point in points) for axis in (0, 1, 2)]
+    log("  габарит прочитанной геометрии: {:.1f} x {:.1f} x {:.1f} мм".format(*sizes))
+    if min(sizes) < 1e-6:
+        err("геометрия плоская по одной из осей — координаты прочитаны неверно.")
+
+
 def face_extent(face, points):
     """Габарит детали поперёк плоскости грани."""
     return max(abs(dot(sub(point, face.origin), face.normal))
@@ -1461,6 +1485,7 @@ def find_plate_faces(faces, thickness_hint=None):
             planar.append(result)
 
     log("  граней просмотрено: {}, плоских: {}".format(len(faces), len(planar)))
+    report_model_size(all_points)
     log("  рёбра: по кривой {}, по концам {}, не прочитано {}"
         " (диапазон подобран у {})".format(
             STATS["curve"], STATS["ends"], STATS["failed"], STATS["located"]))
