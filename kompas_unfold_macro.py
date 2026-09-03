@@ -52,11 +52,15 @@ CONFIG = {
 
     # Геометрия
     "tolerance": 0.02,            # точность аппроксимации кривых, мм
+    "arc_tolerance": 0.01,        # допуск при распознавании дуг и окружностей
     "plane_tolerance": 0.05,      # допуск на плоскостность грани, мм
     "weld_tolerance": 0.05,       # допуск на стыковку рёбер в контур, мм
     "min_segment": 1e-4,          # короче этого сегменты выбрасываются, мм
 
     # Файл
+    "dxf_version": "R2000",       # R2000 хранит вес линии; R12 — запасной
+    "lineweight": 0.6,            # вес линии, мм: КОМПАС читает его как
+                                  # стиль "Основная" (тонкая — это 0.2)
     "encoding": "cp1251",         # кодировка DXF (кириллица в артикуле)
     "zero_origin": True,          # сдвинуть контур в первый квадрант от (0,0)
     "overwrite": True,            # перезаписывать существующий DXF
@@ -1657,10 +1661,12 @@ def flatten(face, extra=None):
     axis_x, axis_y = plane_axes(face.normal)
 
     def to_plane(chains):
+        # Точки не прореживаем: лишние снимет разбор контура на примитивы,
+        # а до него прореживание испортило бы дуги.
         result = []
         for chain in chains:
-            flat = simplify([project(point, face.origin, axis_x, axis_y)
-                             for point in chain])
+            flat = [project(point, face.origin, axis_x, axis_y)
+                    for point in chain]
             if len(flat) >= 2:
                 result.append(flat)
         return result
@@ -1675,27 +1681,6 @@ def flatten(face, extra=None):
                                 for chain in chains]
         loops, extras = shift(loops), shift(extras)
     return loops, extras
-
-
-def simplify(points):
-    """
-    Выбрасывает точки, лежащие на прямой в пределах допуска.
-    Дуги и сплайны при этом сохраняют форму, а прямые участки
-    не превращаются в частокол вершин.
-    """
-    if len(points) < 3:
-        return points
-
-    tolerance = CONFIG["tolerance"]
-    result = [points[0]]
-    for index in range(1, len(points) - 1):
-        previous = result[-1]
-        current = points[index]
-        following = points[index + 1]
-        if point_line_distance(current, previous, following) > tolerance:
-            result.append(current)
-    result.append(points[-1])
-    return result
 
 
 def point_line_distance(point, start, finish):
@@ -1714,25 +1699,178 @@ def is_closed(loop):
 
 
 # ============================================================
-# ЗАПИСЬ DXF (R12)
+# РАЗБОР КОНТУРА НА ОТРЕЗКИ, ДУГИ И ОКРУЖНОСТИ
+# ============================================================
+#
+# Кривые читаются из модели точками, поэтому в DXF они попали бы ломаными.
+# Здесь ломаная разбирается обратно на геометрические примитивы: подряд
+# идущие точки, ложащиеся на одну окружность, становятся дугой, лежащие на
+# одной прямой — отрезком. Замкнутый контур целиком на окружности пишется
+# окружностью.
+
+def distance_2d(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def circle_through(a, b, c):
+    """Окружность через три точки: (центр, радиус) или None для прямой."""
+    area = 2.0 * (a[0] * (b[1] - c[1]) +
+                  b[0] * (c[1] - a[1]) +
+                  c[0] * (a[1] - b[1]))
+    if abs(area) < 1e-12:
+        return None
+    sa = a[0] * a[0] + a[1] * a[1]
+    sb = b[0] * b[0] + b[1] * b[1]
+    sc = c[0] * c[0] + c[1] * c[1]
+    x = (sa * (b[1] - c[1]) + sb * (c[1] - a[1]) + sc * (a[1] - b[1])) / area
+    y = (sa * (c[0] - b[0]) + sb * (a[0] - c[0]) + sc * (b[0] - a[0])) / area
+    centre = (x, y)
+    return centre, distance_2d(centre, a)
+
+
+def on_circle(points, centre, radius, tolerance):
+    """
+    Лежит ли ломаная на окружности.
+
+    Мало проверить сами точки: углы прямоугольника тоже лежат на общей
+    окружности. Поэтому проверяются ещё и середины хорд — у настоящей дуги
+    ломаная идёт вплотную к окружности, у прямоугольника середина стороны
+    отстоит от неё далеко.
+    """
+    for point in points:
+        if abs(distance_2d(point, centre) - radius) > tolerance:
+            return False
+    for index in range(len(points) - 1):
+        middle = ((points[index][0] + points[index + 1][0]) / 2.0,
+                  (points[index][1] + points[index + 1][1]) / 2.0)
+        if abs(distance_2d(middle, centre) - radius) > tolerance * 10.0:
+            return False
+    return True
+
+
+def on_line(points, start, finish, tolerance):
+    for point in points:
+        if point_line_distance(point, start, finish) > tolerance:
+            return False
+    return True
+
+
+def arc_end(points, start, tolerance):
+    """Наибольший индекс, до которого точки лежат на одной дуге."""
+    best = start
+    index = start + 3
+    while index < len(points):
+        middle = points[(start + index) // 2]
+        fitted = circle_through(points[start], middle, points[index])
+        if fitted is None:
+            break
+        centre, radius = fitted
+        if radius > 1e5:
+            break
+        if not on_circle(points[start:index + 1], centre, radius, tolerance):
+            break
+        best = index
+        index += 1
+    return best
+
+
+def line_end(points, start, tolerance):
+    """Наибольший индекс, до которого точки лежат на одной прямой."""
+    best = start + 1
+    index = start + 2
+    while index < len(points):
+        if not on_line(points[start:index + 1], points[start], points[index],
+                       tolerance):
+            break
+        best = index
+        index += 1
+    return best
+
+
+def arc_angles(centre, start, finish, middle):
+    """Углы дуги против часовой стрелки, как того требует DXF."""
+    def angle(point):
+        return math.degrees(math.atan2(point[1] - centre[1],
+                                       point[0] - centre[0])) % 360.0
+
+    first, last, mid = angle(start), angle(finish), angle(middle)
+    # Средняя точка обязана лежать внутри дуги: иначе стороны меняются.
+    inside = (first - last) % 360.0 > (first - mid) % 360.0
+    return (last, first) if inside else (first, last)
+
+
+def contour_segments(points, closed, tolerance=None):
+    """Ломаная -> список примитивов: line, arc, circle."""
+    if tolerance is None:
+        tolerance = CONFIG["arc_tolerance"]
+
+    chain = list(points)
+    if closed and len(chain) > 2 and distance_2d(chain[0], chain[-1]) <= tolerance:
+        chain = chain[:-1]
+    if len(chain) < 2:
+        return []
+
+    if closed:
+        count = len(chain)
+        if count >= 8:
+            fitted = circle_through(chain[0], chain[count // 3],
+                                    chain[2 * count // 3])
+            if fitted and on_circle(chain, fitted[0], fitted[1], tolerance):
+                return [("circle", fitted[0], fitted[1])]
+        chain = chain + [chain[0]]
+
+    segments = []
+    index = 0
+    while index < len(chain) - 1:
+        finish = arc_end(chain, index, tolerance)
+        if finish - index >= 3:
+            middle = chain[(index + finish) // 2]
+            centre, radius = circle_through(chain[index], middle, chain[finish])
+            first, last = arc_angles(centre, chain[index], chain[finish], middle)
+            segments.append(("arc", centre, radius, first, last))
+            index = finish
+            continue
+        finish = line_end(chain, index, tolerance)
+        segments.append(("line", chain[index], chain[finish]))
+        index = finish
+    return segments
+
+
+# ============================================================
+# ЗАПИСЬ DXF
 # ============================================================
 
 class DxfWriter(object):
     """
-    Минимальный писатель DXF R12: только то, что нужно раскрою.
-    Формат R12 понимают все CAM-системы лазерной резки.
+    Писатель DXF: отрезки, дуги, окружности и текст.
+
+    По умолчанию пишется R2000 — только этот формат хранит вес линии, по
+    которому КОМПАС назначает импортируемой геометрии стиль "Основная".
+    R12 остаётся запасным вариантом на случай капризов стороннего CAM:
+    он проще, но веса линий в нём нет.
     """
+
+    MODEL_SPACE = "1F"
 
     def __init__(self):
         self.entities = []
         self.layers = []
         self.bounds = [None, None, None, None]
+        self.handle = 0x100
+        self.modern = CONFIG["dxf_version"].upper() != "R12"
+        self.lineweight = int(round(CONFIG["lineweight"] * 100))
+
+    # --- служебное ---
+
+    def next_handle(self):
+        self.handle += 1
+        return "{:X}".format(self.handle)
 
     def layer(self, name, color=7):
         if name not in [item[0] for item in self.layers]:
             self.layers.append((name, color))
 
-    def _track(self, x, y):
+    def track(self, x, y):
         min_x, min_y, max_x, max_y = self.bounds
         self.bounds = [
             x if min_x is None else min(min_x, x),
@@ -1741,24 +1879,159 @@ class DxfWriter(object):
             y if max_y is None else max(max_y, y),
         ]
 
-    def polyline(self, layer, points, closed):
+    def head(self, kind, layer, subclass):
+        """Общее начало объекта: дескриптор, слой, вес линии."""
+        out = ["0", kind]
+        if self.modern:
+            out += ["5", self.next_handle(), "330", self.MODEL_SPACE,
+                    "100", "AcDbEntity"]
+        out += ["8", layer]
+        if self.modern:
+            out += ["370", str(self.lineweight), "100", subclass]
+        return out
+
+    # --- примитивы ---
+
+    def line(self, layer, start, finish):
         self.layer(layer)
-        body = ["0", "POLYLINE", "8", layer, "66", "1", "70",
-                "1" if closed else "0",
-                "10", "0.0", "20", "0.0", "30", "0.0"]
-        for x, y in points:
-            self._track(x, y)
-            body += ["0", "VERTEX", "8", layer,
-                     "10", fmt(x), "20", fmt(y), "30", "0.0"]
-        body += ["0", "SEQEND", "8", layer]
-        self.entities += body
+        self.track(*start)
+        self.track(*finish)
+        self.entities += self.head("LINE", layer, "AcDbLine") + [
+            "10", fmt(start[0]), "20", fmt(start[1]), "30", "0.0",
+            "11", fmt(finish[0]), "21", fmt(finish[1]), "31", "0.0"]
+
+    def arc(self, layer, centre, radius, first, last):
+        self.layer(layer)
+        self.track(centre[0] - radius, centre[1] - radius)
+        self.track(centre[0] + radius, centre[1] + radius)
+        self.entities += self.head("ARC", layer, "AcDbCircle") + [
+            "10", fmt(centre[0]), "20", fmt(centre[1]), "30", "0.0",
+            "40", fmt(radius)]
+        if self.modern:
+            self.entities += ["100", "AcDbArc"]
+        self.entities += ["50", fmt(first), "51", fmt(last)]
+
+    def circle(self, layer, centre, radius):
+        self.layer(layer)
+        self.track(centre[0] - radius, centre[1] - radius)
+        self.track(centre[0] + radius, centre[1] + radius)
+        self.entities += self.head("CIRCLE", layer, "AcDbCircle") + [
+            "10", fmt(centre[0]), "20", fmt(centre[1]), "30", "0.0",
+            "40", fmt(radius)]
+
+    def segments(self, layer, primitives):
+        for item in primitives:
+            if item[0] == "line":
+                self.line(layer, item[1], item[2])
+            elif item[0] == "arc":
+                self.arc(layer, item[1], item[2], item[3], item[4])
+            elif item[0] == "circle":
+                self.circle(layer, item[1], item[2])
 
     def text(self, layer, x, y, height, value):
         self.layer(layer, color=3)
-        self._track(x, y)
-        self.entities += ["0", "TEXT", "8", layer,
-                          "10", fmt(x), "20", fmt(y), "30", "0.0",
-                          "40", fmt(height), "1", value, "7", "STANDARD"]
+        self.track(x, y)
+        self.entities += self.head("TEXT", layer, "AcDbText") + [
+            "10", fmt(x), "20", fmt(y), "30", "0.0",
+            "40", fmt(height), "1", value, "7", "STANDARD"]
+        if self.modern:
+            self.entities += ["100", "AcDbText"]
+
+    # --- сборка файла ---
+
+    def table_entry(self, kind, owner, subclass, body):
+        out = ["0", kind]
+        if self.modern:
+            out += ["5", self.next_handle(), "330", owner,
+                    "100", "AcDbSymbolTableRecord", "100", subclass]
+        return out + body
+
+    def table(self, name, owner, entries):
+        out = ["0", "TABLE", "2", name]
+        if self.modern:
+            out += ["5", owner, "330", "0", "100", "AcDbSymbolTable"]
+        out += ["70", str(len(entries))]
+        for entry in entries:
+            out += entry
+        return out + ["0", "ENDTAB"]
+
+    def tables(self):
+        line_types = [
+            self.table_entry("LTYPE", "5", "AcDbLinetypeTableRecord",
+                             ["2", "ByBlock", "70", "0", "3", "", "72", "65",
+                              "73", "0", "40", "0.0"]),
+            self.table_entry("LTYPE", "5", "AcDbLinetypeTableRecord",
+                             ["2", "ByLayer", "70", "0", "3", "", "72", "65",
+                              "73", "0", "40", "0.0"]),
+            self.table_entry("LTYPE", "5", "AcDbLinetypeTableRecord",
+                             ["2", "CONTINUOUS", "70", "0", "3", "Solid line",
+                              "72", "65", "73", "0", "40", "0.0"]),
+        ]
+
+        layers = [self.table_entry("LAYER", "2", "AcDbLayerTableRecord",
+                                   ["2", "0", "70", "0", "62", "7",
+                                    "6", "CONTINUOUS"] +
+                                   (["370", str(self.lineweight),
+                                     "390", "F"] if self.modern else []))]
+        for name, color in self.layers:
+            layers.append(self.table_entry(
+                "LAYER", "2", "AcDbLayerTableRecord",
+                ["2", name, "70", "0", "62", str(color), "6", "CONTINUOUS"] +
+                (["370", str(self.lineweight), "390", "F"]
+                 if self.modern else [])))
+
+        styles = [self.table_entry(
+            "STYLE", "3", "AcDbTextStyleTableRecord",
+            ["2", "STANDARD", "70", "0", "40", "0.0", "41", "1.0",
+             "50", "0.0", "71", "0", "42", "2.5", "3", "txt", "4", ""])]
+
+        out = []
+        out += self.table("LTYPE", "5", line_types)
+        out += self.table("LAYER", "2", layers)
+        out += self.table("STYLE", "3", styles)
+        if self.modern:
+            out += self.table("APPID", "9", [self.table_entry(
+                "APPID", "9", "AcDbRegAppTableRecord", ["2", "ACAD", "70", "0"])])
+            out += self.table("VIEW", "6", [])
+            out += self.table("UCS", "7", [])
+            out += self.table("VPORT", "8", [])
+            out += self.table("DIMSTYLE", "A", [])
+            out += ["0", "TABLE", "2", "BLOCK_RECORD", "5", "1",
+                    "330", "0", "100", "AcDbSymbolTable", "70", "2",
+                    "0", "BLOCK_RECORD", "5", self.MODEL_SPACE, "330", "1",
+                    "100", "AcDbSymbolTableRecord", "100", "AcDbBlockTableRecord",
+                    "2", "*Model_Space",
+                    "0", "BLOCK_RECORD", "5", "1B", "330", "1",
+                    "100", "AcDbSymbolTableRecord", "100", "AcDbBlockTableRecord",
+                    "2", "*Paper_Space",
+                    "0", "ENDTAB"]
+        return out
+
+    def blocks(self):
+        if not self.modern:
+            return []
+        out = []
+        for name, record, block, endblk in (
+                ("*Model_Space", self.MODEL_SPACE, "20", "21"),
+                ("*Paper_Space", "1B", "22", "23")):
+            out += ["0", "BLOCK", "5", block, "330", record,
+                    "100", "AcDbEntity", "8", "0", "100", "AcDbBlockBegin",
+                    "2", name, "70", "0",
+                    "10", "0.0", "20", "0.0", "30", "0.0", "3", name, "1", "",
+                    "0", "ENDBLK", "5", endblk, "330", record,
+                    "100", "AcDbEntity", "8", "0", "100", "AcDbBlockEnd"]
+        return out
+
+    def objects(self):
+        if not self.modern:
+            return []
+        return ["0", "SECTION", "2", "OBJECTS",
+                "0", "DICTIONARY", "5", "C", "330", "0",
+                "100", "AcDbDictionary", "281", "1",
+                "3", "ACAD_GROUP", "350", "D",
+                "0", "DICTIONARY", "5", "D", "330", "C",
+                "100", "AcDbDictionary", "281", "1",
+                "0", "ENDSEC"]
 
     def dumps(self):
         min_x, min_y, max_x, max_y = self.bounds
@@ -1767,43 +2040,35 @@ class DxfWriter(object):
         max_x = 0.0 if max_x is None else max_x
         max_y = 0.0 if max_y is None else max_y
 
-        lines = [
-            "0", "SECTION", "2", "HEADER",
-            "9", "$ACADVER", "1", "AC1009",
-            "9", "$INSUNITS", "70", "4",
-            "9", "$MEASUREMENT", "70", "1",
-            "9", "$EXTMIN", "10", fmt(min_x), "20", fmt(min_y), "30", "0.0",
-            "9", "$EXTMAX", "10", fmt(max_x), "20", fmt(max_y), "30", "0.0",
-            "0", "ENDSEC",
-            "0", "SECTION", "2", "TABLES",
-            "0", "TABLE", "2", "LTYPE", "70", "1",
-            "0", "LTYPE", "2", "CONTINUOUS", "70", "0",
-            "3", "Solid line", "72", "65", "73", "0", "40", "0.0",
-            "0", "ENDTAB",
-            "0", "TABLE", "2", "LAYER", "70", str(len(self.layers)),
-        ]
-        for name, color in self.layers:
-            lines += ["0", "LAYER", "2", name, "70", "0",
-                      "62", str(color), "6", "CONTINUOUS"]
-        lines += [
-            "0", "ENDTAB",
-            "0", "TABLE", "2", "STYLE", "70", "1",
-            "0", "STYLE", "2", "STANDARD", "70", "0", "40", "0.0",
-            "41", "1.0", "50", "0.0", "71", "0", "42", "2.5",
-            "3", "txt", "4", "",
-            "0", "ENDTAB",
-            "0", "ENDSEC",
-            "0", "SECTION", "2", "ENTITIES",
-        ]
-        lines += self.entities
-        lines += ["0", "ENDSEC", "0", "EOF"]
+        version = "AC1015" if self.modern else "AC1009"
+        header = ["0", "SECTION", "2", "HEADER",
+                  "9", "$ACADVER", "1", version,
+                  "9", "$INSUNITS", "70", "4",
+                  "9", "$MEASUREMENT", "70", "1",
+                  "9", "$LUNITS", "70", "2",
+                  "9", "$EXTMIN", "10", fmt(min_x), "20", fmt(min_y), "30", "0.0",
+                  "9", "$EXTMAX", "10", fmt(max_x), "20", fmt(max_y), "30", "0.0"]
+        if self.modern:
+            # Вес линии должен отображаться, иначе КОМПАС покажет тонкую.
+            header += ["9", "$LWDISPLAY", "290", "1",
+                       "9", "$HANDSEED", "5", "{:X}".format(self.handle + 100)]
+        header += ["0", "ENDSEC"]
+
+        lines = list(header)
+        if self.modern:
+            lines += ["0", "SECTION", "2", "CLASSES", "0", "ENDSEC"]
+        lines += ["0", "SECTION", "2", "TABLES"] + self.tables() + ["0", "ENDSEC"]
+        if self.modern:
+            lines += ["0", "SECTION", "2", "BLOCKS"] + self.blocks() + ["0", "ENDSEC"]
+        lines += ["0", "SECTION", "2", "ENTITIES"] + self.entities + ["0", "ENDSEC"]
+        lines += self.objects()
+        lines += ["0", "EOF"]
         return "\r\n".join(lines) + "\r\n"
 
     def save(self, path):
         data = self.dumps()
-        encoding = CONFIG["encoding"]
         with open(path, "wb") as handle:
-            handle.write(data.encode(encoding, "replace"))
+            handle.write(data.encode(CONFIG["encoding"], "replace"))
 
 
 def fmt(value):
@@ -1818,19 +2083,24 @@ def write_dxf(path, loops, article, bend_lines=None):
     cut_layer = CONFIG["cut_layer"]
     open_loops = 0
 
+    counts = {"line": 0, "arc": 0, "circle": 0}
     for loop in loops:
         closed = is_closed(loop)
         if not closed:
             open_loops += 1
-        points = loop[:-1] if closed and len(loop) > 2 else loop
-        writer.polyline(cut_layer, points, closed)
+        primitives = contour_segments(loop, closed)
+        for item in primitives:
+            counts[item[0]] += 1
+        writer.segments(cut_layer, primitives)
 
+    ok("примитивов: отрезков {}, дуг {}, окружностей {}".format(
+        counts["line"], counts["arc"], counts["circle"]))
     if open_loops:
         warn("незамкнутых контуров: {} — проверьте файл перед резкой".format(open_loops))
 
     if CONFIG["add_bend_lines"] and bend_lines:
         for line in bend_lines:
-            writer.polyline(CONFIG["bend_layer"], line, False)
+            writer.segments(CONFIG["bend_layer"], contour_segments(line, False))
         ok("линии гиба записаны в слой {}: {}".format(
             CONFIG["bend_layer"], len(bend_lines)))
 
