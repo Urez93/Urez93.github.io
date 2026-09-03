@@ -220,6 +220,9 @@ def _safe_attr(obj, name, default=""):
 _working_mass_accessor = {"name": None, "logged": False}
 _MASS_ACCESSOR_CANDIDATES = ("Mass", "GetMassCentrProperties", "MassInertiaParams")
 
+# Компас возвращает массу в граммах — переводим в килограммы для вывода.
+_MASS_GRAMS_TO_KG = 1000.0
+
 
 def _try_mass_accessor(part, name):
     try:
@@ -250,7 +253,7 @@ def get_mass(part):
     if name is not None:
         value = _try_mass_accessor(part, name)
         if value is not None:
-            return value
+            return value / _MASS_GRAMS_TO_KG
         _working_mass_accessor["name"] = None
 
     for candidate in _MASS_ACCESSOR_CANDIDATES:
@@ -258,7 +261,7 @@ def get_mass(part):
         if value is not None:
             _working_mass_accessor["name"] = candidate
             _log("  ✓ Масса получена через {}".format(candidate))
-            return value
+            return value / _MASS_GRAMS_TO_KG
 
     if not _working_mass_accessor["logged"]:
         _log(
@@ -268,6 +271,59 @@ def get_mass(part):
             "вывод консоли, подберём точный вызов.".format(_MASS_ACCESSOR_CANDIDATES)
         )
         _working_mass_accessor["logged"] = True
+    return None
+
+
+_working_spec_section_accessor = {"name": None, "logged": False}
+_SPEC_SECTION_ACCESSOR_CANDIDATES = (
+    "SpecSectionType", "SectionType", "SpecificationSectionType",
+    "SpcSectionType", "Section", "SpecSection",
+)
+
+
+def _try_spec_section_accessor(part, name):
+    try:
+        attr = getattr(part, name)
+        result = attr() if callable(attr) else attr
+    except Exception:
+        return None
+    if result is None or result == "":
+        return None
+    return result
+
+
+def get_spec_section(part):
+    """
+    Пытается получить "Раздел спецификации" детали. Как и масса, это
+    свойство НЕ подтверждено предыдущей разведкой API (в первой
+    разведке у IPart7 среди 42 членов ничего похожего на "спец"/"section"
+    не нашлось) — пробуем несколько вероятных вариантов и запоминаем
+    первый рабочий. Значение возвращается как есть (текст или число —
+    если это окажется числовой код раздела, а не готовый текст, дайте
+    знать, добавим расшифровку в текст).
+    """
+    name = _working_spec_section_accessor["name"]
+    if name is not None:
+        value = _try_spec_section_accessor(part, name)
+        if value is not None:
+            return value
+        _working_spec_section_accessor["name"] = None
+
+    for candidate in _SPEC_SECTION_ACCESSOR_CANDIDATES:
+        value = _try_spec_section_accessor(part, candidate)
+        if value is not None:
+            _working_spec_section_accessor["name"] = candidate
+            _log("  ✓ Раздел спецификации получен через {}".format(candidate))
+            return value
+
+    if not _working_spec_section_accessor["logged"]:
+        _log(
+            "  ! Не удалось получить 'Раздел спецификации' ни одним из способов {} — "
+            "столбец останется пустым. Пришлите вывод консоли, подберём точный вызов.".format(
+                _SPEC_SECTION_ACCESSOR_CANDIDATES
+            )
+        )
+        _working_spec_section_accessor["logged"] = True
     return None
 
 
@@ -420,6 +476,7 @@ def collect_bom_rows(part, level=1, rows=None, visited=None, quantity=1, childre
     marking = _bom_clean(_safe_attr(part, "Marking", ""))
     material = _clean_material_display(_safe_attr(part, "Material", ""))
     mass = get_mass(part)
+    spec_section = _bom_clean(get_spec_section(part))
 
     rows.append({
         "level": level,
@@ -428,6 +485,7 @@ def collect_bom_rows(part, level=1, rows=None, visited=None, quantity=1, childre
         "Материал": material,
         "Количество": quantity,
         "Масса": mass,
+        "Раздел спецификации": spec_section,
         "_is_node": bool(children),
         "_total_quantity": total_quantity,
     })
@@ -476,6 +534,7 @@ def build_summary_rows(rows):
                 "Материал": row["Материал"],
                 "Количество": 0,
                 "Масса": row.get("Масса"),
+                "Раздел спецификации": row.get("Раздел спецификации", ""),
                 "_is_node": row["_is_node"],
             }
             order.append(key)
@@ -863,6 +922,7 @@ SUMMARY_COLUMNS = [
     ("Материал", "Материал"),
     ("Масса", "Масса"),
     ("Масса общая", "Масса общая"),
+    ("Раздел спецификации", "Раздел спецификации"),
 ]
 
 # "Прочие изделия" / "Гидравлика" / "Метиз" / "Токарка" — списки позиций.
@@ -961,7 +1021,7 @@ def build_structured_workbook_from_rows(rows, output_path):
             "header": summary_header,
             "data_rows": summary_data_rows,
             "name_col_index": 1,
-            "col_widths": [20, 55, 12, 30, 12, 14],
+            "col_widths": [20, 55, 12, 30, 12, 14, 22],
             "tree_style": False,
         },
         {
