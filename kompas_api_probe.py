@@ -50,6 +50,14 @@ def _try_attrs(obj, names, label):
 
 def _try_collection_access(obj, label):
     print("  Пробуем получить количество элементов и первый элемент [{}]:".format(label))
+
+    if isinstance(obj, (list, tuple)):
+        print("    Результат — обычный Python {} длиной {}".format(type(obj).__name__, len(obj)))
+        first = obj[0] if obj else None
+        if first is not None:
+            print("    Первый элемент, тип: {}".format(type(first)))
+        return len(obj), first
+
     count = None
     for name in ("Count", "GetCount", "Length"):
         try:
@@ -110,12 +118,40 @@ def main():
 
     print()
     print("-" * 70)
-    print("top_part.PartsEx")
+    print("top_part.PartsEx — это МЕТОД (нужны аргументы), пробуем разные сигнатуры")
     print("-" * 70)
+
+    call_attempts = [
+        ("PartsEx()", lambda: top_part.PartsEx()),
+        ("PartsEx(True)", lambda: top_part.PartsEx(True)),
+        ("PartsEx(False)", lambda: top_part.PartsEx(False)),
+        ("PartsEx(True, True)", lambda: top_part.PartsEx(True, True)),
+        ("PartsEx(False, False)", lambda: top_part.PartsEx(False, False)),
+        ("PartsEx(True, False)", lambda: top_part.PartsEx(True, False)),
+        ("PartsEx(False, True)", lambda: top_part.PartsEx(False, True)),
+        ("PartsEx(0)", lambda: top_part.PartsEx(0)),
+        ("PartsEx(1)", lambda: top_part.PartsEx(1)),
+    ]
+
+    parts_ex = None
+    for name, action in call_attempts:
+        try:
+            result = action()
+            print("  ✓ {} сработал, тип результата: {}, значение (если короткое): {!r}".format(
+                name, type(result), result if not hasattr(result, "__len__") or len(str(result)) < 200 else "<длинное>"
+            ))
+            if result:
+                parts_ex = result
+                print("    -> будем использовать этот результат для дальнейшего разбора")
+                break
+        except Exception as e:
+            print("  ✗ {} не сработал: {}".format(name, e))
+
     try:
-        parts_ex = top_part.PartsEx
-        print("Тип parts_ex:", type(parts_ex))
-        count, first_child = _try_collection_access(parts_ex, "PartsEx")
+        if parts_ex is not None:
+            print()
+            print("Тип parts_ex:", type(parts_ex))
+        count, first_child = _try_collection_access(parts_ex, "PartsEx(...)") if parts_ex is not None else (None, None)
 
         if first_child is not None:
             print()
@@ -127,12 +163,20 @@ def main():
 
             print()
             print("  Проверяем, есть ли у дочерней детали свой PartsEx (можно ли идти глубже)...")
-            try:
-                child_parts_ex = first_child.PartsEx
-                print("    ✓ У дочерней детали есть PartsEx:", type(child_parts_ex))
-                _try_collection_access(child_parts_ex, "child.PartsEx")
-            except Exception as e:
-                print("    ✗ У дочерней детали нет PartsEx:", e)
+            child_parts_ex = None
+            for name, action in (
+                ("child.PartsEx()", lambda: first_child.PartsEx()),
+                ("child.PartsEx(True)", lambda: first_child.PartsEx(True)),
+                ("child.PartsEx(True, True)", lambda: first_child.PartsEx(True, True)),
+            ):
+                try:
+                    child_parts_ex = action()
+                    print("    ✓ {} сработал, тип: {}".format(name, type(child_parts_ex)))
+                    break
+                except Exception as e:
+                    print("    ✗ {} не сработал: {}".format(name, e))
+            if child_parts_ex is not None:
+                _try_collection_access(child_parts_ex, "child.PartsEx(...)")
         else:
             print("Не удалось получить первый дочерний элемент — сборка либо пуста, "
                   "либо нужен другой способ доступа (пришлите этот вывод).")
