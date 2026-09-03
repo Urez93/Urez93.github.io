@@ -1115,6 +1115,7 @@ class PlanarFace(object):
         self.normal = normal
         self.area = area
         self.source = None        # исходный IFace, если нужен самому КОМПАСу
+        self.extent = None        # габарит всей детали поперёк этой грани
 
 
 def fit_plane(points):
@@ -1286,14 +1287,16 @@ def size_text(face):
 
 def report_candidates(planar, thickness_hint, count=6):
     """Крупнейшие плоские грани — чтобы было видно, из чего шёл выбор."""
-    log("  кандидаты (площадь, габарит, контуров, замкнуты, обратная сторона):")
+    log("  кандидаты (площадь, габарит грани, поперёк детали, контуров,"
+        " замкнуты, обратная сторона):")
     for face in planar[:count]:
         closed = all(norm(sub(loop[0], loop[-1])) <= CONFIG["weld_tolerance"]
                      for loop in face.loops)
         found = opposite_face(face, planar, thickness_hint)
         pair = "{:.2f} мм".format(found[1]) if found else "нет"
-        log("    {:>12.2f} мм2 {:>18} {:>3} {:>8} {:>10}".format(
-            face.area, size_text(face), len(face.loops),
+        across = "{:.2f} мм".format(face.extent) if face.extent is not None else "?"
+        log("    {:>12.2f} мм2 {:>18} {:>10} {:>3} {:>8} {:>10}".format(
+            face.area, size_text(face), across, len(face.loops),
             "да" if closed else "НЕТ", pair))
 
 
@@ -1315,6 +1318,40 @@ def estimate_thickness(planar, count=10):
             if best is None or distance < best:
                 best = distance
     return best
+
+
+def face_extent(face, points):
+    """Габарит детали поперёк плоскости грани."""
+    return max(abs(dot(sub(point, face.origin), face.normal))
+               for point in points)
+
+
+def drop_side_faces(planar, thickness):
+    """
+    Оставляет только грани сторон листа.
+
+    Признак прямой: поперёк грани развёртки деталь тонкая — ровно на
+    толщину материала, а поперёк торца она во всю ширину детали. Габарит
+    самой грани для этого не годится: у торца с фаской он уже не равен
+    толщине, и торец проходит фильтр.
+    """
+    if not planar or planar[0].extent is None:
+        return planar
+
+    if not thickness:
+        thickness = min(face.extent for face in planar)
+
+    limit = thickness * 1.5 + 0.5
+    kept = [face for face in planar if face.extent <= limit]
+
+    dropped = len(planar) - len(kept)
+    if not kept:
+        warn("нет граней, поперёк которых деталь была бы толщиной {:.2f} мм."
+             .format(thickness))
+        return planar
+    if dropped:
+        ok("отсеяно граней поперёк детали (торцы и т.п.): {}".format(dropped))
+    return kept
 
 
 def drop_edge_faces(planar, thickness):
@@ -1434,8 +1471,11 @@ def find_plate_faces(faces, thickness_hint=None):
         return None, None, None
 
     planar.sort(key=lambda item: item.area, reverse=True)
+    for face in planar:
+        face.extent = face_extent(face, all_points)
 
     thickness_hint = thickness_hint or estimate_thickness(planar)
+    planar = drop_side_faces(planar, thickness_hint)
     planar = drop_edge_faces(planar, thickness_hint)
     report_candidates(planar, thickness_hint)
 
@@ -1456,14 +1496,11 @@ def find_plate_faces(faces, thickness_hint=None):
         warn("парная грань не найдена, толщина не определена.")
         log("      Возможен зеркальный контур — проверьте деталь перед резкой.")
 
-    # Габарит детали поперёк наибольшей грани: у плоской заготовки он равен
+    # Габарит детали поперёк выбранной грани: у плоской заготовки он равен
     # толщине листа, у согнутой — заметно больше.
-    extent = 0.0
-    for point in all_points:
-        extent = max(extent, abs(dot(sub(point, best.origin), best.normal)))
-    ok("габарит поперёк грани: {:.2f} мм".format(extent))
+    ok("габарит поперёк грани: {:.2f} мм".format(best.extent))
 
-    return best, thickness, extent
+    return best, thickness, best.extent
 
 
 # ============================================================
