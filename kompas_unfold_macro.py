@@ -12,7 +12,8 @@
          заготовка, модель не трогается.
   4. Находит наибольшую плоскую грань, снимает её контуры
      (внешний + отверстия) и определяет толщину материала.
-  5. Пишет DXF (R12, мм) РЯДОМ С МОДЕЛЬЮ и С ТЕМ ЖЕ ИМЕНЕМ.
+  5. Пишет DXF (мм) РЯДОМ С МОДЕЛЬЮ, имя модели плюс толщина:
+     "ДИ10.600.09.00.002 Пластина s12.dxf".
 
 DXF пишется собственным писателем, поэтому в файл попадают только контуры
 реза (слой CUT) - без рамок, основных надписей, размеров и осевых линий.
@@ -66,6 +67,7 @@ CONFIG = {
     "encoding": "cp1251",         # кодировка DXF (кириллица в артикуле)
     "zero_origin": True,          # сдвинуть контур в первый квадрант от (0,0)
     "overwrite": True,            # перезаписывать существующий DXF
+    "thickness_in_name": True,    # добавлять к имени толщину: "Деталь s12.dxf"
 
     # Поведение
     "unfold_sheet_metal": True,   # разворачивать листовое тело автоматически
@@ -2317,6 +2319,17 @@ def probe(application):
 # ГЛАВНАЯ ПРОЦЕДУРА
 # ============================================================
 
+def thickness_suffix(thickness):
+    """
+    Толщина в имени файла: 12 -> " s12", 1.5 -> " s1.5".
+    Без толщины суффикса нет — имя остаётся как у модели.
+    """
+    if not CONFIG["thickness_in_name"] or not thickness or thickness <= 0:
+        return ""
+    text = "{:.2f}".format(thickness).rstrip("0").rstrip(".")
+    return " s{}".format(text)
+
+
 def sheet_thickness(part):
     """Толщина листа из параметров листового тела."""
     for body in sheet_bodies(part):
@@ -2388,7 +2401,8 @@ def export_active_part(application):
 
         output = os.path.join(
             os.path.dirname(path),
-            os.path.splitext(os.path.basename(path))[0] + ".dxf",
+            os.path.splitext(os.path.basename(path))[0] +
+            thickness_suffix(sheet_thickness(part) or thickness) + ".dxf",
         )
         if os.path.exists(output) and not CONFIG["overwrite"]:
             err("файл уже существует: {}".format(output))
