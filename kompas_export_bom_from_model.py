@@ -294,12 +294,18 @@ def _group_children(children):
     return [(r, c, gc) for r, c, gc, _cat, _mk, _nm in result]
 
 
-def collect_bom_rows(part, level=1, rows=None, visited=None, quantity=1, children=None):
+def collect_bom_rows(part, level=1, rows=None, visited=None, quantity=1, children=None, total_quantity=1):
     """
     Рекурсивно собирает строки состава изделия из дерева PartsEx.
+
     `children`, если передан, — уже полученный список дочерних деталей
     этой детали (чтобы не запрашивать PartsEx повторно: он уже был
     вызван в _group_children родителя при классификации/сортировке).
+
+    `total_quantity` — сквозное количество этой позиции по всему
+    изделию (произведение количеств вдоль всей цепочки родителей), а
+    не только "локально" внутри своего непосредственного узла. Нужно
+    для сводной ведомости на втором листе (см. build_summary_rows).
     """
     if rows is None:
         rows = []
@@ -313,6 +319,9 @@ def collect_bom_rows(part, level=1, rows=None, visited=None, quantity=1, childre
             return rows
         visited.add(unique_num)
 
+    if children is None:
+        children = get_child_parts(part)
+
     name = _bom_clean(_safe_attr(part, "Name", ""))
     marking = _bom_clean(_safe_attr(part, "Marking", ""))
     material = _bom_clean(_safe_attr(part, "Material", ""))
@@ -323,6 +332,8 @@ def collect_bom_rows(part, level=1, rows=None, visited=None, quantity=1, childre
         "Обозначение": marking,
         "Материал": material,
         "Количество": quantity,
+        "_is_node": bool(children),
+        "_total_quantity": total_quantity,
     })
 
     if len(rows) >= MAX_ROWS:
@@ -333,22 +344,53 @@ def collect_bom_rows(part, level=1, rows=None, visited=None, quantity=1, childre
         _log("  ! Достигнута максимальная глубина {} — дальше не углубляемся.".format(MAX_DEPTH))
         return rows
 
-    if children is None:
-        children = get_child_parts(part)
-
     for representative, count, grandchildren in _group_children(children):
-        collect_bom_rows(representative, level + 1, rows, visited, quantity=count, children=grandchildren)
+        collect_bom_rows(
+            representative, level + 1, rows, visited,
+            quantity=count, children=grandchildren, total_quantity=total_quantity * count,
+        )
 
     return rows
 
 
-def _build_tree_flags(rows):
-    """Помечает строки, у которых есть дочерние (для стиля 'узел')."""
-    for i, row in enumerate(rows):
-        level = row["level"]
-        is_node = i + 1 < len(rows) and rows[i + 1]["level"] > level
-        row["_is_node"] = is_node
-    return rows
+def build_summary_rows(rows):
+    """
+    Сводная ведомость: одна строка на каждую уникальную позицию
+    (обозначение+наименование+материал), собранная СО ВСЕХ узлов и
+    подузлов — количество суммируется по всему изделию (across всех
+    мест, где эта позиция встречается), с учётом умножения количества
+    вверх по цепочке вложенности. Верхний узел (само изделие,
+    level == 1) в сводку не включается.
+
+    Одинаковые позиции не дублируются строками — суммируются в одну.
+    Порядок — тот же, что и на листе "Состав изделия": сначала
+    подузлы, затем собственные детали, стандартные изделия и ПКИ
+    внизу, внутри категории — по обозначению (А-Я).
+    """
+    order = []
+    groups = {}
+    for row in rows:
+        if row["level"] == 1:
+            continue
+        key = (row["Обозначение"], row["Наименование"], row["Материал"])
+        if key not in groups:
+            groups[key] = {
+                "Обозначение": row["Обозначение"],
+                "Наименование": row["Наименование"],
+                "Материал": row["Материал"],
+                "Количество": 0,
+                "_is_node": row["_is_node"],
+            }
+            order.append(key)
+        groups[key]["Количество"] += row["_total_quantity"]
+
+    result = [groups[key] for key in order]
+    result.sort(key=lambda item: (
+        _classify(item["Обозначение"], item["_is_node"]),
+        item["Обозначение"].lower(),
+        item["Наименование"].lower(),
+    ))
+    return result
 
 
 def _bom_clean(value):
@@ -475,12 +517,13 @@ def _xlsx_cell_xml(col_index, row_index, value, style_id):
     )
 
 
-def _write_xlsx(output_path, header, data_rows, name_col_index):
+def _build_sheet_xml(header, data_rows, name_col_index, col_widths, styles, tree_style):
     """
-    Пишет .xlsx напрямую (zip + XML), без openpyxl. data_rows — список
-    словарей {"level": int, "is_node": bool, "cells": [значения по столбцам]}.
+    Строит XML одного листа (<worksheet>...). data_rows — список словарей
+    {"level": int, "is_node": bool, "cells": [...]}. Если tree_style
+    выключен — пишутся обычные плоские строки, без отступов и
+    группировки (для сводной ведомости).
     """
-    styles = _StyleRegistry()
     header_style = styles.xf_id(bold=True, color="FFFFFFFF", fill="FF4472C4", align="center", wrap=True)
     normal_style = styles.xf_id()
     node_style = styles.xf_id(bold=True, fill="FFDCE6F1")
@@ -495,30 +538,32 @@ def _write_xlsx(output_path, header, data_rows, name_col_index):
 
     last_row_num = 1
     for row_idx, row in enumerate(data_rows, start=2):
-        level = row["level"]
-        is_node = row["is_node"]
+        level = row.get("level", 1)
+        is_node = row.get("is_node", False)
         cells = row["cells"]
 
         cells_xml = []
         for c in range(ncols):
             value = cells[c] if c < len(cells) else None
-            if c == name_col_index:
+            if tree_style and c == name_col_index:
                 indent = min(max(level - 1, 0), 14)
                 style_id = styles.xf_id(bold=is_node, fill="FFDCE6F1" if is_node else None, indent=indent)
             else:
                 style_id = node_style if is_node else normal_style
             cells_xml.append(_xlsx_cell_xml(c, row_idx, value, style_id))
 
-        outline_level = min(max(level - 1, 0), 7)
-        sheet_xml_rows.append(
-            '<row r="{}" outlineLevel="{}">{}</row>'.format(row_idx, outline_level, "".join(cells_xml))
-        )
+        if tree_style:
+            outline_level = min(max(level - 1, 0), 7)
+            sheet_xml_rows.append(
+                '<row r="{}" outlineLevel="{}">{}</row>'.format(row_idx, outline_level, "".join(cells_xml))
+            )
+        else:
+            sheet_xml_rows.append('<row r="{}">{}</row>'.format(row_idx, "".join(cells_xml)))
         last_row_num = row_idx
 
     last_col_letters = _col_index_to_letters(ncols - 1)
     dimension_ref = "A1:{}{}".format(last_col_letters, last_row_num)
 
-    col_widths = [10, 20, 55, 12, 30]
     cols_xml = "".join(
         '<col min="{0}" max="{0}" width="{1}" customWidth="1"/>'.format(
             i + 1, col_widths[i] if i < len(col_widths) else 15
@@ -526,10 +571,12 @@ def _write_xlsx(output_path, header, data_rows, name_col_index):
         for i in range(ncols)
     )
 
+    sheet_pr = '<sheetPr><outlinePr summaryBelow="0" summaryRight="0"/></sheetPr>' if tree_style else ""
+
     sheet_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        '<sheetPr><outlinePr summaryBelow="0" summaryRight="0"/></sheetPr>'
+        + sheet_pr +
         '<dimension ref="{dimension}"/>'
         '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
         'activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft"/></sheetView></sheetViews>'
@@ -540,6 +587,30 @@ def _write_xlsx(output_path, header, data_rows, name_col_index):
         "</worksheet>"
     ).format(dimension=dimension_ref, cols=cols_xml, rows="".join(sheet_xml_rows))
 
+    return sheet_xml
+
+
+def _write_workbook(output_path, sheets):
+    """
+    Пишет .xlsx с одним или несколькими листами напрямую (zip + XML),
+    без openpyxl. `sheets` — список словарей:
+    {"name": str, "header": [...], "data_rows": [...], "name_col_index": int,
+     "col_widths": [...], "tree_style": bool}.
+    """
+    styles = _StyleRegistry()
+
+    sheet_xmls = []
+    for sheet in sheets:
+        sheet_xmls.append(_build_sheet_xml(
+            sheet["header"], sheet["data_rows"], sheet["name_col_index"],
+            sheet["col_widths"], styles, sheet["tree_style"],
+        ))
+
+    content_type_overrides = "".join(
+        '<Override PartName="/xl/worksheets/sheet{0}.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'.format(i + 1)
+        for i in range(len(sheets))
+    )
     content_types = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
@@ -547,8 +618,7 @@ def _write_xlsx(output_path, header, data_rows, name_col_index):
         '<Default Extension="xml" ContentType="application/xml"/>'
         '<Override PartName="/xl/workbook.xml" '
         'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-        '<Override PartName="/xl/worksheets/sheet1.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        + content_type_overrides +
         '<Override PartName="/xl/styles.xml" '
         'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
         "</Types>"
@@ -563,23 +633,32 @@ def _write_xlsx(output_path, header, data_rows, name_col_index):
         "</Relationships>"
     )
 
+    sheet_entries = "".join(
+        '<sheet name="{}" sheetId="{}" r:id="rId{}"/>'.format(_xml_escape(sheet["name"]), i + 1, i + 1)
+        for i, sheet in enumerate(sheets)
+    )
     workbook_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        '<sheets><sheet name="Состав изделия" sheetId="1" r:id="rId1"/></sheets>'
+        '<sheets>{}</sheets>'
         "</workbook>"
-    )
+    ).format(sheet_entries)
 
+    styles_rid = len(sheets) + 1
+    workbook_rels_entries = "".join(
+        '<Relationship Id="rId{0}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet{0}.xml"/>'.format(i + 1)
+        for i in range(len(sheets))
+    )
     workbook_rels = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" '
-        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
-        'Target="worksheets/sheet1.xml"/>'
-        '<Relationship Id="rId2" '
+        + workbook_rels_entries +
+        '<Relationship Id="rId{}" '
         'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
-        'Target="styles.xml"/>'
+        'Target="styles.xml"/>'.format(styles_rid) +
         "</Relationships>"
     )
 
@@ -592,19 +671,30 @@ def _write_xlsx(output_path, header, data_rows, name_col_index):
         zf.writestr("xl/workbook.xml", workbook_xml)
         zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
         zf.writestr("xl/styles.xml", styles.to_xml())
-        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        for i, sheet_xml in enumerate(sheet_xmls):
+            zf.writestr("xl/worksheets/sheet{}.xml".format(i + 1), sheet_xml)
 
     return output_path
 
 
-def build_structured_workbook_from_rows(rows, output_path):
-    """Пишет наглядный xlsx с деревом прямо из уже собранных строк состава изделия."""
-    rows = _build_tree_flags(rows)
+SUMMARY_COLUMNS = [
+    ("Обозначение", "Обозначение"),
+    ("Наименование", "Наименование"),
+    ("Количество", "Количество"),
+    ("Материал", "Материал"),
+]
 
+
+def build_structured_workbook_from_rows(rows, output_path):
+    """
+    Пишет xlsx с двумя листами: "Состав изделия" (наглядное дерево с
+    отступами и группировкой) и "Сводная ведомость" (плоский список
+    всех позиций по всему изделию, одинаковые — суммированы).
+    """
     header = [title for title, _ in BOM_OUTPUT_COLUMNS]
     name_col_index = [i for i, (_, key) in enumerate(BOM_OUTPUT_COLUMNS) if key == "Наименование"][0]
 
-    data_rows = []
+    tree_data_rows = []
     for row in rows:
         level = row.get("level", 1)
         cells = []
@@ -614,9 +704,41 @@ def build_structured_workbook_from_rows(rows, output_path):
             else:
                 value = _bom_clean(row.get(key, ""))
                 cells.append(value if value != "" else None)
-        data_rows.append({"level": level, "is_node": row.get("_is_node", False), "cells": cells})
+        tree_data_rows.append({"level": level, "is_node": row.get("_is_node", False), "cells": cells})
 
-    return _write_xlsx(output_path, header, data_rows, name_col_index)
+    summary_header = [title for title, _ in SUMMARY_COLUMNS]
+    summary_data_rows = []
+    for item in build_summary_rows(rows):
+        cells = []
+        for _, key in SUMMARY_COLUMNS:
+            value = item.get(key, "")
+            if key == "Количество":
+                cells.append(value)
+            else:
+                value = _bom_clean(value)
+                cells.append(value if value != "" else None)
+        summary_data_rows.append({"is_node": item.get("_is_node", False), "cells": cells})
+
+    sheets = [
+        {
+            "name": "Состав изделия",
+            "header": header,
+            "data_rows": tree_data_rows,
+            "name_col_index": name_col_index,
+            "col_widths": [10, 20, 55, 12, 30],
+            "tree_style": True,
+        },
+        {
+            "name": "Сводная ведомость",
+            "header": summary_header,
+            "data_rows": summary_data_rows,
+            "name_col_index": 1,
+            "col_widths": [20, 55, 12, 30],
+            "tree_style": False,
+        },
+    ]
+
+    return _write_workbook(output_path, sheets)
 
 
 # ---------------------------------------------------------------------------
