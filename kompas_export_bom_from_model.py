@@ -19,15 +19,18 @@
      с открытой моделью, временный плоский файл удаляет.
 
 Требования:
-  - pywin32 (win32com) — связь с Компасом;
-  - openpyxl (и xlrd, если промежуточный файл получится в старом .xls).
+  - pywin32 (win32com) — связь с Компасом. Больше НИЧЕГО стороннего не
+    требуется: чтение и запись .xlsx сделаны на чистой стандартной
+    библиотеке Python (zipfile + xml), потому что во встроенном
+    интерпретаторе Компаса нет pip/openpyxl, и ставить их туда не нужно.
 
 Файл полностью самостоятельный (логика построения структуры из
 kompas_bom_structure.py включена сюда же) — это специально сделано,
 потому что встроенный Python в Компасе не всегда видит соседние .py
 файлы через обычный импорт (другая рабочая директория/__file__).
 Для ручной пост-обработки уже сохранённых файлов вне Компаса можно
-по-прежнему пользоваться отдельным kompas_bom_structure.py.
+по-прежнему пользоваться отдельным kompas_bom_structure.py (он
+использует openpyxl, если он есть в обычном Python на компьютере).
 
 ВАЖНО про надёжность:
   Точные названия свойств/методов COM-объектов и числовые коды формата
@@ -40,6 +43,10 @@ kompas_bom_structure.py включена сюда же) — это специа�
 """
 
 import os
+import re
+import zipfile
+from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape as _xml_escape
 
 
 DOCUMENT_TYPE_SPECIFICATION = 5  # ksDocumentSpecification
@@ -48,6 +55,10 @@ DOCUMENT_TYPE_SPECIFICATION = 5  # ksDocumentSpecification
 # Построение структурированной таблицы (та же логика, что в
 # kompas_bom_structure.py, включена сюда, чтобы макрос не зависел от
 # импорта соседнего файла внутри встроенного Python Компаса).
+#
+# Чтение и запись .xlsx реализованы вручную поверх zipfile/xml — во
+# встроенном Python Компаса нет openpyxl/xlrd и обычно нет pip, чтобы их
+# поставить, а .xlsx — это просто zip-архив с XML-файлами внутри.
 # ---------------------------------------------------------------------------
 
 BOM_OUTPUT_COLUMNS = [
@@ -66,32 +77,116 @@ BOM_OUTPUT_COLUMNS = [
     ("Примечание", "Примечание"),
 ]
 
+_SS_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_COL_REF_RE = re.compile(r"([A-Z]+)(\d+)")
 
-def _read_bom_source_rows(path):
-    """Читает исходную плоскую выгрузку (.xls или .xlsx) построчно."""
-    ext = os.path.splitext(path)[1].lower()
 
-    if ext == ".xls":
-        import xlrd
-        wb = xlrd.open_workbook(path)
-        sh = wb.sheet_by_index(0)
-        header = [str(sh.cell_value(0, c)).strip() for c in range(sh.ncols)]
+def _col_letters_to_index(letters):
+    """'A' -> 0, 'B' -> 1, ... 'AA' -> 26 ..."""
+    idx = 0
+    for ch in letters:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
+
+
+def _col_index_to_letters(index):
+    """0 -> 'A', 1 -> 'B', ... 26 -> 'AA' ..."""
+    index += 1
+    letters = ""
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
+
+
+def _read_xlsx_rows(path):
+    """Читает первый лист .xlsx-файла без сторонних библиотек."""
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+
+        shared_strings = []
+        if "xl/sharedStrings.xml" in names:
+            root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in root.findall(_SS_NS + "si"):
+                text = "".join(t.text or "" for t in si.iter(_SS_NS + "t"))
+                shared_strings.append(text)
+
+        sheet_candidates = sorted(
+            n for n in names if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
+        )
+        if not sheet_candidates:
+            raise RuntimeError("В файле {} не найден лист с данными.".format(path))
+        sheet_name = "xl/worksheets/sheet1.xml" if "xl/worksheets/sheet1.xml" in sheet_candidates else sheet_candidates[0]
+
+        root = ET.fromstring(zf.read(sheet_name))
+        sheet_data = root.find(_SS_NS + "sheetData")
+
         rows = []
-        for r in range(1, sh.nrows):
-            values = [sh.cell_value(r, c) for c in range(sh.ncols)]
-            row = dict(zip(header, values))
-            if any(str(v).strip() for v in values):
-                rows.append(row)
+        if sheet_data is None:
+            return rows
+
+        for row_el in sheet_data.findall(_SS_NS + "row"):
+            row_values = {}
+            max_col = -1
+            next_col = 0
+            for c_el in row_el.findall(_SS_NS + "c"):
+                ref = c_el.get("r", "")
+                match = _COL_REF_RE.match(ref)
+                col_idx = _col_letters_to_index(match.group(1)) if match else next_col
+                next_col = col_idx + 1
+
+                cell_type = c_el.get("t")
+                value = None
+
+                if cell_type == "s":
+                    v_el = c_el.find(_SS_NS + "v")
+                    if v_el is not None and v_el.text is not None:
+                        value = shared_strings[int(v_el.text)]
+                elif cell_type == "inlineStr":
+                    is_el = c_el.find(_SS_NS + "is")
+                    if is_el is not None:
+                        value = "".join(t.text or "" for t in is_el.iter(_SS_NS + "t"))
+                elif cell_type == "str":
+                    v_el = c_el.find(_SS_NS + "v")
+                    value = v_el.text if v_el is not None else None
+                elif cell_type == "b":
+                    v_el = c_el.find(_SS_NS + "v")
+                    value = bool(int(v_el.text)) if v_el is not None else None
+                else:
+                    v_el = c_el.find(_SS_NS + "v")
+                    if v_el is not None and v_el.text is not None:
+                        text = v_el.text
+                        try:
+                            value = float(text)
+                        except ValueError:
+                            value = text
+
+                row_values[col_idx] = value
+                if col_idx > max_col:
+                    max_col = col_idx
+
+            rows.append([row_values.get(i) for i in range(max_col + 1)])
         return rows
 
-    import openpyxl
-    wb = openpyxl.load_workbook(path, data_only=True)
-    sh = wb.active
-    rows_iter = sh.iter_rows(values_only=True)
-    header = [str(v).strip() if v is not None else "" for v in next(rows_iter)]
+
+def _read_bom_source_rows(path):
+    """Читает исходную плоскую выгрузку Компаса (.xlsx) построчно, без сторонних библиотек."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext != ".xlsx":
+        raise RuntimeError(
+            "Ожидается временный файл в формате .xlsx, получено: {}. "
+            "Если Компас сохраняет спецификацию только в старом .xls, "
+            "сообщите об этом — потребуется другой способ чтения.".format(ext)
+        )
+
+    all_rows = _read_xlsx_rows(path)
+    if not all_rows:
+        return []
+
+    header = [str(v).strip() if v is not None else "" for v in all_rows[0]]
     rows = []
-    for values in rows_iter:
-        if values is None or all(v is None for v in values):
+    for values in all_rows[1:]:
+        if not any(v not in (None, "") for v in values):
             continue
         row = dict(zip(header, values))
         rows.append(row)
@@ -128,75 +223,242 @@ def _build_bom_tree_rows(source_rows):
     return source_rows
 
 
-def build_structured_workbook(source_path, output_path):
-    """Читает плоскую выгрузку Компаса и сохраняет наглядный xlsx с деревом."""
-    import openpyxl
-    from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
+class _StyleRegistry(object):
+    """Собирает уникальные комбинации шрифт+заливка+отступ в компактный список cellXfs."""
 
+    def __init__(self):
+        self.fonts = [{"bold": False, "color": None}]
+        self.fills = [{"color": None}, {"color": None}]  # 0, 1 зарезервированы конвенцией OOXML
+        self.xfs = [{"font": 0, "fill": 0, "indent": 0, "align": None, "wrap": False}]  # 0 — стиль по умолчанию
+        self._font_cache = {(False, None): 0}
+        self._fill_cache = {None: 0}
+        self._xf_cache = {}
+
+    def _font_id(self, bold, color=None):
+        key = (bold, color)
+        if key not in self._font_cache:
+            self.fonts.append({"bold": bold, "color": color})
+            self._font_cache[key] = len(self.fonts) - 1
+        return self._font_cache[key]
+
+    def _fill_id(self, color):
+        if color not in self._fill_cache:
+            self.fills.append({"color": color})
+            self._fill_cache[color] = len(self.fills) - 1
+        return self._fill_cache[color]
+
+    def xf_id(self, bold=False, color=None, fill=None, indent=0, align=None, wrap=False):
+        font_id = self._font_id(bold, color)
+        fill_id = self._fill_id(fill)
+        key = (font_id, fill_id, indent, align, wrap)
+        if key not in self._xf_cache:
+            self.xfs.append({"font": font_id, "fill": fill_id, "indent": indent, "align": align, "wrap": wrap})
+            self._xf_cache[key] = len(self.xfs) - 1
+        return self._xf_cache[key]
+
+    def to_xml(self):
+        parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
+        parts.append(
+            '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        )
+
+        parts.append('<fonts count="{}">'.format(len(self.fonts)))
+        for f in self.fonts:
+            bold_tag = "<b/>" if f["bold"] else ""
+            color_tag = '<color rgb="{}"/>'.format(f["color"]) if f["color"] else ""
+            parts.append('<font>{}<sz val="10"/><name val="Calibri"/>{}</font>'.format(bold_tag, color_tag))
+        parts.append("</fonts>")
+
+        parts.append('<fills count="{}">'.format(len(self.fills)))
+        parts.append('<fill><patternFill patternType="none"/></fill>')
+        parts.append('<fill><patternFill patternType="gray125"/></fill>')
+        for f in self.fills[2:]:
+            parts.append(
+                '<fill><patternFill patternType="solid">'
+                '<fgColor rgb="{0}"/><bgColor rgb="{0}"/></patternFill></fill>'.format(f["color"])
+            )
+        parts.append("</fills>")
+
+        parts.append('<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>')
+        parts.append('<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>')
+
+        parts.append('<cellXfs count="{}">'.format(len(self.xfs)))
+        for xf in self.xfs:
+            align_bits = []
+            if xf["align"]:
+                align_bits.append('horizontal="{}"'.format(xf["align"]))
+            align_bits.append('vertical="center"')
+            if xf["indent"]:
+                align_bits.append('indent="{}"'.format(xf["indent"]))
+            if xf["wrap"]:
+                align_bits.append('wrapText="1"')
+            parts.append(
+                '<xf numFmtId="0" fontId="{}" fillId="{}" borderId="0" xfId="0" applyFont="1" '
+                'applyFill="1" applyAlignment="1"><alignment {}/></xf>'.format(
+                    xf["font"], xf["fill"], " ".join(align_bits)
+                )
+            )
+        parts.append("</cellXfs>")
+        parts.append('<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>')
+
+        parts.append("</styleSheet>")
+        return "".join(parts)
+
+
+def _xlsx_cell_xml(col_index, row_index, value, style_id):
+    ref = "{}{}".format(_col_index_to_letters(col_index), row_index)
+    if value is None or value == "":
+        return '<c r="{}" s="{}"/>'.format(ref, style_id)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return '<c r="{}" s="{}"><v>{}</v></c>'.format(ref, style_id, value)
+    return '<c r="{}" s="{}" t="inlineStr"><is><t xml:space="preserve">{}</t></is></c>'.format(
+        ref, style_id, _xml_escape(str(value))
+    )
+
+
+def _write_xlsx(output_path, header, data_rows, name_col_index):
+    """
+    Пишет .xlsx напрямую (zip + XML), без openpyxl. data_rows — список
+    словарей {"level": int, "is_node": bool, "cells": [значения по столбцам]}.
+    """
+    styles = _StyleRegistry()
+    header_style = styles.xf_id(bold=True, color="FFFFFFFF", fill="FF4472C4", align="center", wrap=True)
+    normal_style = styles.xf_id()
+    node_style = styles.xf_id(bold=True, fill="FFDCE6F1")
+
+    ncols = len(header)
+    sheet_xml_rows = []
+
+    header_cells = "".join(
+        _xlsx_cell_xml(c, 1, header[c], header_style) for c in range(ncols)
+    )
+    sheet_xml_rows.append('<row r="1" ht="30" customHeight="1">{}</row>'.format(header_cells))
+
+    last_row_num = 1
+    for row_idx, row in enumerate(data_rows, start=2):
+        level = row["level"]
+        is_node = row["is_node"]
+        cells = row["cells"]
+
+        cells_xml = []
+        for c in range(ncols):
+            value = cells[c] if c < len(cells) else None
+            if c == name_col_index:
+                indent = min(max(level - 1, 0), 14)
+                style_id = styles.xf_id(bold=is_node, fill="FFDCE6F1" if is_node else None, indent=indent)
+            else:
+                style_id = node_style if is_node else normal_style
+            cells_xml.append(_xlsx_cell_xml(c, row_idx, value, style_id))
+
+        outline_level = min(max(level - 1, 0), 7)
+        sheet_xml_rows.append(
+            '<row r="{}" outlineLevel="{}">{}</row>'.format(row_idx, outline_level, "".join(cells_xml))
+        )
+        last_row_num = row_idx
+
+    last_col_letters = _col_index_to_letters(ncols - 1)
+    dimension_ref = "A1:{}{}".format(last_col_letters, last_row_num)
+
+    col_widths = [10, 10, 20, 55, 10, 10, 30, 20, 12, 20, 22, 22, 25]
+    cols_xml = "".join(
+        '<col min="{0}" max="{0}" width="{1}" customWidth="1"/>'.format(
+            i + 1, col_widths[i] if i < len(col_widths) else 15
+        )
+        for i in range(ncols)
+    )
+
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<sheetPr><outlinePr summaryBelow="0" summaryRight="0"/></sheetPr>'
+        '<dimension ref="{dimension}"/>'
+        '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
+        'activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft"/></sheetView></sheetViews>'
+        '<sheetFormatPr defaultRowHeight="15"/>'
+        '<cols>{cols}</cols>'
+        '<sheetData>{rows}</sheetData>'
+        '<autoFilter ref="{dimension}"/>'
+        "</worksheet>"
+    ).format(dimension=dimension_ref, cols=cols_xml, rows="".join(sheet_xml_rows))
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '<Override PartName="/xl/styles.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        "</Types>"
+    )
+
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/>'
+        "</Relationships>"
+    )
+
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="Состав изделия" sheetId="1" r:id="rId1"/></sheets>'
+        "</workbook>"
+    )
+
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet1.xml"/>'
+        '<Relationship Id="rId2" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
+        'Target="styles.xml"/>'
+        "</Relationships>"
+    )
+
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", root_rels)
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        zf.writestr("xl/styles.xml", styles.to_xml())
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+
+    return output_path
+
+
+def build_structured_workbook(source_path, output_path):
+    """Читает плоскую выгрузку Компаса и сохраняет наглядный xlsx с деревом (без сторонних библиотек)."""
     rows = _read_bom_source_rows(source_path)
     rows = _build_bom_tree_rows(rows)
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Состав изделия"
+    header = [title for title, _ in BOM_OUTPUT_COLUMNS]
+    name_col_index = [i for i, (_, key) in enumerate(BOM_OUTPUT_COLUMNS) if key == "Наименование"][0]
 
-    # Группировка строк сворачивается кнопкой над группой (родитель сверху).
-    ws.sheet_properties.outlinePr.summaryBelow = False
-    ws.sheet_properties.outlinePr.summaryRight = False
-
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="4472C4")
-    node_font = Font(bold=True)
-    node_fill = PatternFill("solid", fgColor="DCE6F1")
-
-    for col_idx, (title, _) in enumerate(BOM_OUTPUT_COLUMNS, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=title)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    name_col_index = [
-        i for i, (_, key) in enumerate(BOM_OUTPUT_COLUMNS, start=1) if key == "Наименование"
-    ][0]
-
-    excel_row = 2
+    data_rows = []
     for row in rows:
         level = row.get("level", 1)
-        is_node = row.get("_is_node", False)
-
-        for col_idx, (_, key) in enumerate(BOM_OUTPUT_COLUMNS, start=1):
+        cells = []
+        for _, key in BOM_OUTPUT_COLUMNS:
             if key == "level":
-                value = level
+                cells.append(level)
             else:
                 value = _bom_clean(row.get(key, ""))
-                if value == "":
-                    value = None
-            cell = ws.cell(row=excel_row, column=col_idx, value=value)
+                cells.append(value if value != "" else None)
+        data_rows.append({"level": level, "is_node": row.get("_is_node", False), "cells": cells})
 
-            if col_idx == name_col_index:
-                cell.alignment = Alignment(indent=min(level - 1, 14) * 2, vertical="center")
-            else:
-                cell.alignment = Alignment(vertical="center")
-
-            if is_node:
-                cell.font = node_font
-                cell.fill = node_fill
-
-        # Excel допускает outline_level от 0 до 7 — глубже сворачивать не даст,
-        # но отступ в названии по-прежнему покажет реальный уровень.
-        ws.row_dimensions[excel_row].outline_level = min(max(level - 1, 0), 7)
-        excel_row += 1
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = "A1:{}{}".format(get_column_letter(len(BOM_OUTPUT_COLUMNS)), excel_row - 1)
-
-    widths = [10, 10, 20, 55, 10, 10, 30, 20, 12, 20, 22, 22, 25]
-    for col_idx, width in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
-
-    wb.save(output_path)
-    return output_path
+    return _write_xlsx(output_path, header, data_rows, name_col_index)
 
 
 def _log(msg):
