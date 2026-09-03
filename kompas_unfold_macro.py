@@ -42,6 +42,8 @@ CONFIG = {
     # Слои DXF
     "cut_layer": "CUT",           # контуры реза
     "mark_layer": "MARK",         # артикул детали
+    "bend_layer": "BEND",         # линии гиба
+    "add_bend_lines": False,      # писать линии гиба отдельным слоем
 
     # Артикул (по умолчанию выключен — в DXF идут только контуры реза)
     "add_article": False,         # писать артикул в DXF
@@ -555,8 +557,8 @@ def set_fixed_face(holder, part):
     Назначает неподвижную грань развёртки, если в модели она не задана.
     Берётся наибольшая плоская грань — обычно это основание детали.
     """
-    face, _, _ = find_plate_faces(collect_faces(get_bodies(part)),
-                                  sheet_thickness(part))
+    face = find_plate_faces(collect_faces(get_bodies(part)),
+                            sheet_thickness(part))[0]
     if face is None or face.source is None:
         return False
 
@@ -863,17 +865,25 @@ def collect_faces(bodies):
     return api5_faces()
 
 
+def face_edges(face):
+    """
+    Рёбра грани как ломаные, до сшивки в контуры.
+
+    Именно рёбра, а не готовые контуры, нужны для склейки соседних граней:
+    общее ребро двух граней встречается в списке дважды.
+    """
+    chains = []
+    for owner in get_loops(face) or [face]:
+        for edge in get_edges(owner):
+            points = edge_polyline(edge)
+            if points and len(points) >= 2:
+                chains.append(points)
+    return chains
+
+
 def face_contours(face):
-    """
-    Контуры грани в 3D. Если API отдаёт циклы — берём их (внешний контур и
-    отверстия разделены самим КОМПАСом), иначе сшиваем рёбра по концам.
-    """
-    contours = []
-    for loop in get_loops(face):
-        contours.extend(build_loops(get_edges(loop)))
-    if contours:
-        return contours
-    return build_loops(get_edges(face))
+    """Контуры грани в 3D: рёбра, сшитые по совпадающим концам."""
+    return build_loops(face_edges(face))
 
 
 def curve_of(edge):
@@ -1123,6 +1133,7 @@ class PlanarFace(object):
         self.area = area
         self.source = None        # исходный IFace, если нужен самому КОМПАСу
         self.extent = None        # габарит всей детали поперёк этой грани
+        self.edges = []           # рёбра грани до сшивки — нужны для склейки
 
 
 def fit_plane(points):
@@ -1162,16 +1173,12 @@ def plane_residual(points, center, normal):
     return max(abs(dot(sub(point, center), normal)) for point in points)
 
 
-def build_loops(edges):
+def build_loops(polylines):
     """
-    Собирает рёбра в замкнутые контуры по совпадению концов.
+    Сшивает ломаные рёбер в замкнутые контуры по совпадению концов.
     Возвращает список списков 3D-точек.
     """
-    chains = []
-    for edge in edges:
-        points = edge_polyline(edge)
-        if points and len(points) >= 2:
-            chains.append(points)
+    chains = [points for points in polylines if points and len(points) >= 2]
     if not chains:
         return []
 
@@ -1327,6 +1334,98 @@ def estimate_thickness(planar, count=10):
     return best
 
 
+# ============================================================
+# СТОРОНА ЛИСТА ИЗ НЕСКОЛЬКИХ ГРАНЕЙ
+# ============================================================
+#
+# У развёрнутой заготовки сторона листа — это не одна грань: зоны гибов
+# остаются отдельными гранями, отделёнными линиями радиусов. Все они лежат
+# в одной плоскости, поэтому грани группируются по плоскости, а контур
+# заготовки собирается склейкой их рёбер.
+
+class PlaneGroup(object):
+    """Сторона листа: набор граней, лежащих в одной плоскости."""
+
+    def __init__(self, face):
+        self.faces = [face]
+        self.origin = face.origin
+        self.normal = face.normal
+        self.area = face.area
+        self.extent = face.extent
+        self.loops = list(face.loops)
+
+    def add(self, face):
+        self.faces.append(face)
+        self.area += face.area
+        self.loops.extend(face.loops)
+        if face.area > self.faces[0].area:
+            # Плоскость задаёт самая крупная грань группы.
+            self.origin, self.normal = face.origin, face.normal
+
+
+def same_plane(group, face):
+    """Лежит ли грань в плоскости группы."""
+    if abs(abs(dot(group.normal, face.normal)) - 1.0) > 1e-3:
+        return False
+    offset = abs(dot(sub(face.origin, group.origin), group.normal))
+    return offset <= CONFIG["plane_tolerance"] * 4
+
+
+def group_faces(planar):
+    """Разбивает плоские грани на стороны листа."""
+    groups = []
+    for face in planar:
+        for group in groups:
+            if same_plane(group, face):
+                group.add(face)
+                break
+        else:
+            groups.append(PlaneGroup(face))
+    groups.sort(key=lambda item: item.area, reverse=True)
+    return groups
+
+
+def quantize(point, step=0.01):
+    return tuple(round(coordinate / step) * step for coordinate in point)
+
+
+def edge_signature(points):
+    """Ключ ребра, не зависящий от направления обхода."""
+    ends = tuple(sorted([quantize(points[0]), quantize(points[-1])]))
+    centre = quantize(scale(reduce_sum(points), 1.0 / len(points)))
+    return ends + (centre,)
+
+
+def merge_group(group):
+    """
+    Контур заготовки из граней одной стороны листа.
+
+    Линия гиба принадлежит сразу двум соседним компланарным граням, значит
+    среди их рёбер встречается дважды. Внешний контур и отверстия — по
+    одному разу. Поэтому парные рёбра выбрасываются, а из оставшихся
+    собирается контур всей развёртки.
+
+    Возвращает (контуры, линии_гиба).
+    """
+    buckets = {}
+    for face in group.faces:
+        for points in face.edges:
+            buckets.setdefault(edge_signature(points), []).append(points)
+
+    outline = []
+    shared = []
+    for chains in buckets.values():
+        if len(chains) % 2 == 0:
+            shared.append(chains[0])
+        else:
+            outline.append(chains[0])
+
+    if shared:
+        ok("склеено граней: {}, погашено рёбер по линиям гиба: {}".format(
+            len(group.faces), len(shared)))
+    return build_loops(outline), shared
+
+
 def report_model_size(points):
     """
     Габарит прочитанной геометрии.
@@ -1469,7 +1568,8 @@ def find_plate_faces(faces, thickness_hint=None):
     all_points = []
     for face in faces:
         try:
-            loops = face_contours(face)
+            edges = face_edges(face)
+            loops = build_loops(edges)
         except Exception:
             continue
         if not loops:
@@ -1482,6 +1582,7 @@ def find_plate_faces(faces, thickness_hint=None):
             result = None
         if result is not None and result.area > 0:
             result.source = face
+            result.edges = edges
             planar.append(result)
 
     log("  граней просмотрено: {}, плоских: {}".format(len(faces), len(planar)))
@@ -1493,23 +1594,29 @@ def find_plate_faces(faces, thickness_hint=None):
         warn("большинство рёбер прочитано только по концам — дуги будут спрямлены.")
     if not planar:
         err("плоских граней не найдено.")
-        return None, None, None
+        return None, None, None, []
 
     planar.sort(key=lambda item: item.area, reverse=True)
     for face in planar:
         face.extent = face_extent(face, all_points)
 
-    thickness_hint = thickness_hint or estimate_thickness(planar)
-    planar = drop_side_faces(planar, thickness_hint)
-    planar = drop_edge_faces(planar, thickness_hint)
-    report_candidates(planar, thickness_hint)
+    # Сторона листа может состоять из нескольких граней: зоны гибов
+    # отделены линиями радиусов. Поэтому выбираем плоскость, а не грань.
+    groups = group_faces(planar)
+    log("  плоскостей: {} (граней в наибольшей: {})".format(
+        len(groups), len(groups[0].faces) if groups else 0))
 
-    best, opposite, thickness = choose_plate_face(planar, thickness_hint)
+    thickness_hint = thickness_hint or estimate_thickness(groups)
+    groups = drop_side_faces(groups, thickness_hint)
+    groups = drop_edge_faces(groups, thickness_hint)
+    report_candidates(groups, thickness_hint)
+
+    best, opposite, thickness = choose_plate_face(groups, thickness_hint)
     if best is None:
-        return None, None, None
+        return None, None, None, []
 
-    ok("выбрана грань: площадь {:.2f} мм2, габарит {}".format(
-        best.area, size_text(best)))
+    ok("выбрана сторона листа: граней {}, площадь {:.2f} мм2".format(
+        len(best.faces), best.area))
 
     if opposite is not None:
         ok("толщина материала: {:.2f} мм".format(thickness))
@@ -1525,28 +1632,49 @@ def find_plate_faces(faces, thickness_hint=None):
     # толщине листа, у согнутой — заметно больше.
     ok("габарит поперёк грани: {:.2f} мм".format(best.extent))
 
-    return best, thickness, best.extent
+    loops, bends = merge_group(best)
+    if not loops:
+        err("контур заготовки собрать не удалось.")
+        return None, None, None, []
+
+    result = PlanarFace(loops, best.origin, best.normal, best.area)
+    result.extent = best.extent
+    result.source = best.faces[0].source
+    ok("контуров заготовки: {}, габарит {}".format(len(loops), size_text(result)))
+    return result, thickness, best.extent, bends
 
 
 # ============================================================
 # ПОДГОТОВКА КОНТУРОВ В 2D
 # ============================================================
 
-def flatten(face):
-    """PlanarFace -> список плоских контуров, сдвинутых к началу координат."""
+def flatten(face, extra=None):
+    """
+    PlanarFace -> плоские контуры, сдвинутые к началу координат.
+    extra — дополнительные ломаные (например линии гиба) в той же системе.
+    Возвращает (контуры, дополнительные_ломаные).
+    """
     axis_x, axis_y = plane_axes(face.normal)
-    loops = []
-    for loop in face.loops:
-        flat = [project(point, face.origin, axis_x, axis_y) for point in loop]
-        flat = simplify(flat)
-        if len(flat) >= 2:
-            loops.append(flat)
+
+    def to_plane(chains):
+        result = []
+        for chain in chains:
+            flat = simplify([project(point, face.origin, axis_x, axis_y)
+                             for point in chain])
+            if len(flat) >= 2:
+                result.append(flat)
+        return result
+
+    loops = to_plane(face.loops)
+    extras = to_plane(extra or [])
 
     if CONFIG["zero_origin"] and loops:
         min_x = min(x for loop in loops for x, _ in loop)
         min_y = min(y for loop in loops for _, y in loop)
-        loops = [[(x - min_x, y - min_y) for x, y in loop] for loop in loops]
-    return loops
+        shift = lambda chains: [[(x - min_x, y - min_y) for x, y in chain]
+                                for chain in chains]
+        loops, extras = shift(loops), shift(extras)
+    return loops, extras
 
 
 def simplify(points):
@@ -1682,8 +1810,8 @@ def fmt(value):
     return "{:.6f}".format(float(value))
 
 
-def write_dxf(path, loops, article):
-    """Пишет контуры и артикул в DXF."""
+def write_dxf(path, loops, article, bend_lines=None):
+    """Пишет контуры реза, при необходимости линии гиба и артикул."""
     step("Запись DXF")
 
     writer = DxfWriter()
@@ -1699,6 +1827,12 @@ def write_dxf(path, loops, article):
 
     if open_loops:
         warn("незамкнутых контуров: {} — проверьте файл перед резкой".format(open_loops))
+
+    if CONFIG["add_bend_lines"] and bend_lines:
+        for line in bend_lines:
+            writer.polyline(CONFIG["bend_layer"], line, False)
+        ok("линии гиба записаны в слой {}: {}".format(
+            CONFIG["bend_layer"], len(bend_lines)))
 
     if CONFIG["add_article"] and article:
         min_x, min_y = writer.bounds[0], writer.bounds[1]
@@ -1903,14 +2037,15 @@ def export_active_part(application):
             err("не удалось получить грани детали.")
             return False
 
-        face, thickness, extent = find_plate_faces(faces, sheet_thickness(part))
+        face, thickness, extent, bends = find_plate_faces(
+            faces, sheet_thickness(part))
         if face is None:
             return False
 
         if not check_flat(part, thickness, extent):
             return False
 
-        loops = flatten(face)
+        loops, bend_lines = flatten(face, bends)
         if not loops:
             err("контуры грани не получены.")
             return False
@@ -1923,7 +2058,7 @@ def export_active_part(application):
             err("файл уже существует: {}".format(output))
             return False
 
-        write_dxf(output, loops, get_article(part, path))
+        write_dxf(output, loops, get_article(part, path), bend_lines)
         return True
     finally:
         if restore is not None:
