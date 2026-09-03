@@ -543,13 +543,26 @@ def find_specification_document(app, active_doc):
     return None
 
 
-def export_specification_to_flat_file(spec_doc, temp_path):
-    """Сохраняет спецификацию во временный excel-файл штатными средствами Компаса."""
+def _looks_like_leftover_temp_name(path):
+    """Похоже ли имя файла на след прошлого (некорректного) запуска макроса."""
+    name = os.path.basename(path)
+    return "_temp_export" in name or name.startswith("~")
+
+
+def export_specification_to_flat_file(doc, temp_path):
+    """
+    Экспортирует документ (спецификацию) в excel-файл. ВАЖНО: вызывается
+    только на ОДНОРАЗОВОЙ копии документа (см. export_specification_safely),
+    а не на реальном открытом у пользователя документе — иначе SaveAs
+    переключает сам открытый документ на новый файл, как обычное
+    "Сохранить как", и активная спецификация в Компасе оказывается
+    переименована в этот временный файл.
+    """
     attempts = [
-        ("SaveAs(путь)", lambda: spec_doc.SaveAs(temp_path)),
-        ("SaveAs(путь, 47)", lambda: spec_doc.SaveAs(temp_path, 47)),
-        ("Export(путь, 47)", lambda: spec_doc.Export(temp_path, 47)),
-        ("SaveAsToFormat(путь)", lambda: spec_doc.SaveAsToFormat(temp_path)),
+        ("Export(путь, 47)", lambda: doc.Export(temp_path, 47)),
+        ("SaveAsToFormat(путь)", lambda: doc.SaveAsToFormat(temp_path)),
+        ("SaveAs(путь, 47)", lambda: doc.SaveAs(temp_path, 47)),
+        ("SaveAs(путь)", lambda: doc.SaveAs(temp_path)),
     ]
 
     for name, action in attempts:
@@ -563,6 +576,80 @@ def export_specification_to_flat_file(spec_doc, temp_path):
             _log("  ✗ {} не удалась: {}".format(name, e))
 
     return False
+
+
+def _close_document_without_saving(doc):
+    """Закрывает служебную копию документа, не сохраняя изменения (несколько вариантов вызова)."""
+    for name, action in (
+        ("Close(0)", lambda: doc.Close(0)),
+        ("Close(False)", lambda: doc.Close(False)),
+        ("Close()", lambda: doc.Close()),
+    ):
+        try:
+            action()
+            _log("  ✓ Служебная копия закрыта: {}".format(name))
+            return True
+        except Exception as e:
+            _log("  ✗ {} не удалась: {}".format(name, e))
+    return False
+
+
+def export_specification_safely(app, spec_doc, temp_flat_path):
+    """
+    Безопасно экспортирует спецификацию в excel, НЕ трогая документ,
+    открытый у пользователя: делает файловую копию исходного файла
+    спецификации под другим именем, открывает копию отдельным
+    документом, экспортирует её и закрывает — реальный открытый
+    документ вообще не участвует в SaveAs/Export.
+    """
+    import shutil
+
+    spec_path = get_document_path(spec_doc)
+    if _looks_like_leftover_temp_name(spec_path):
+        raise RuntimeError(
+            "Открытый документ спецификации сейчас указывает на временный файл "
+            "({}) — похоже, это след прошлого неудачного запуска макроса. "
+            "Закройте этот документ в Компасе БЕЗ сохранения и заново откройте "
+            "настоящий файл спецификации, затем запустите макрос ещё раз.".format(spec_path)
+        )
+
+    folder = os.path.dirname(spec_path)
+    ext = os.path.splitext(spec_path)[1] or ".spw"
+    temp_native_copy = os.path.join(folder, "~bom_export_copy{}".format(ext))
+
+    _log("Копируем файл спецификации для безопасного экспорта...")
+    _log("  {} -> {}".format(spec_path, temp_native_copy))
+    shutil.copy2(spec_path, temp_native_copy)
+
+    copy_doc = None
+    try:
+        for name, action in (
+            ("Documents.Open(путь, False)", lambda: app.Documents.Open(temp_native_copy, False)),
+            ("Documents.Open(путь)", lambda: app.Documents.Open(temp_native_copy)),
+        ):
+            try:
+                _log("  Попытка открыть копию: {}...".format(name))
+                copy_doc = action()
+                if copy_doc:
+                    _log("  ✓ Копия открыта: {}".format(name))
+                    break
+            except Exception as e:
+                _log("  ✗ {} не удалась: {}".format(name, e))
+
+        if copy_doc is None:
+            raise RuntimeError("Не удалось открыть временную копию спецификации для экспорта.")
+
+        ok = export_specification_to_flat_file(copy_doc, temp_flat_path)
+        return ok
+
+    finally:
+        if copy_doc is not None:
+            _close_document_without_saving(copy_doc)
+        try:
+            if os.path.exists(temp_native_copy):
+                os.remove(temp_native_copy)
+        except Exception as e:
+            _log("Не удалось удалить временную копию {}: {}".format(temp_native_copy, e))
 
 
 def run_macro():
@@ -579,6 +666,13 @@ def run_macro():
         print()
         _log("Определяем папку активной модели...")
         model_path = get_document_path(active_doc)
+        if _looks_like_leftover_temp_name(model_path):
+            raise RuntimeError(
+                "Активный документ сейчас указывает на временный файл ({}) — "
+                "похоже, это след прошлого неудачного запуска макроса. Закройте "
+                "его в Компасе БЕЗ сохранения, заново откройте настоящий файл "
+                "модели/спецификации и запустите макрос ещё раз.".format(model_path)
+            )
         folder = os.path.dirname(model_path)
         base_name = os.path.splitext(os.path.basename(model_path))[0]
 
@@ -596,8 +690,8 @@ def run_macro():
         output_path = os.path.join(folder, "{}_состав_изделия.xlsx".format(base_name))
 
         print()
-        _log("Экспортируем спецификацию во временный файл...")
-        ok = export_specification_to_flat_file(spec_doc, temp_flat_path)
+        _log("Экспортируем спецификацию во временный файл (через отдельную копию, не трогая открытый документ)...")
+        ok = export_specification_safely(app, spec_doc, temp_flat_path)
         if not ok:
             raise RuntimeError(
                 "Не удалось экспортировать спецификацию автоматически. "
