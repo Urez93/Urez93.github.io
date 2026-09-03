@@ -7,8 +7,9 @@
      python.exe, и из встроенного PyScripter).
   2. Берёт АКТИВНЫЙ 3D-документ и путь к нему на диске.
   3. Определяет тип детали:
-       - листовое тело -> переводит модель в развёрнутое состояние;
-       - твердотельная  -> работает как с плоской пластиной.
+       - листовое тело с гибами -> переводит модель в развёрнутое состояние;
+       - листовое тело без гибов и твердотельная деталь -> плоская
+         заготовка, модель не трогается.
   4. Находит наибольшую плоскую грань, снимает её контуры
      (внешний + отверстия) и определяет толщину материала.
   5. Пишет DXF (R12, мм) РЯДОМ С МОДЕЛЬЮ и С ТЕМ ЖЕ ИМЕНЕМ.
@@ -403,6 +404,49 @@ def sheet_bodies(part):
     return [qi(body, "ISheetMetalBody") for body in as_list(bodies)]
 
 
+BEND_OPERATION_NAMES = [
+    "SheetMetalBends",            # сгиб
+    "SheetMetalSketchBends",      # сгиб по эскизу
+    "SheetMetalLineBends",        # сгиб по линии
+    "SheetMetalBendedStraightens",  # разогнуть/согнуть
+    "SheetMetalFlangings",        # отгиб по кромке
+    "SheetMetalShoulders",        # подсечка
+    "SheetMetalRuledShells",      # обечайка
+    "SheetMetalLinearRuledShells",
+]
+
+
+def count_of(collection):
+    """Число элементов коллекции; None, если это не коллекция."""
+    for name in ("Count", "GetCount"):
+        try:
+            raw = getattr(collection, name)
+            return int(raw() if callable(raw) else raw)
+        except Exception:
+            continue
+    return None
+
+
+def count_bends(part):
+    """Гибообразующие операции детали: (всего, [(операция, сколько)])."""
+    container = sheet_container(part)
+    if container is None:
+        return 0, []
+
+    total = 0
+    details = []
+    for name in BEND_OPERATION_NAMES:
+        try:
+            collection = getattr(container, name)
+        except Exception:
+            continue
+        count = count_of(collection)
+        if count:
+            total += count
+            details.append((name, count))
+    return total, details
+
+
 def find_unfold_flag(part):
     """
     Ищет объект и имя свойства, управляющего состоянием развёртки.
@@ -450,6 +494,15 @@ def ensure_unfolded(part):
         return True, None
 
     ok("деталь листовая")
+
+    # Листовое тело без гибов — это та же плоская заготовка. Разворачивать
+    # нечего, поэтому модель не трогаем: контур снимается как есть.
+    bends, details = count_bends(part)
+    if bends == 0:
+        ok("гибов нет — развёртка не требуется, деталь плоская")
+        return True, None
+    ok("гибов: {} ({})".format(
+        bends, ", ".join("{}: {}".format(name, count) for name, count in details)))
 
     if not CONFIG["unfold_sheet_metal"]:
         warn("автоматическая развёртка отключена в CONFIG")
@@ -1657,6 +1710,7 @@ def probe(application):
     if bodies_sm:
         describe(bodies_sm[0], "ISheetMetalBody")
         log("\nТолщина листа: {}".format(sheet_thickness(part)))
+        log("Гибообразующие операции: {}".format(count_bends(part)))
 
     _, parameters = fetch(sheet, UNFOLD_PARAMETER_NAMES)
     describe(parameters, "Параметры развёртки (объект контейнера)")
@@ -1759,9 +1813,13 @@ def check_flat(part, thickness, extent):
 
     err("деталь не плоская: габарит поперёк грани {:.2f} мм при толщине {:.2f} мм."
         .format(extent, reference))
-    if is_sheet_metal(part):
+    bends = count_bends(part)[0] if part is not None else 0
+    if bends:
         log("    Разверните листовое тело (Листовое тело -> Развернуть)")
         log("    и запустите макрос снова.")
+    elif is_sheet_metal(part):
+        log("    Гибов в детали нет, но она не плоская: похоже, объём даёт")
+        log("    штамповка (жалюзи, буртик, рифт). Развернуть её нельзя.")
     else:
         log("    Развёртка возможна только для листового тела. Преобразуйте")
         log("    деталь командой 'Распознать листовое тело' и повторите.")
