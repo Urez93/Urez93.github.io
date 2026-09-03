@@ -20,8 +20,14 @@
 
 Требования:
   - pywin32 (win32com) — связь с Компасом;
-  - openpyxl (и xlrd, если промежуточный файл получится в старом .xls);
-  - kompas_bom_structure.py должен лежать в той же папке, что и этот файл.
+  - openpyxl (и xlrd, если промежуточный файл получится в старом .xls).
+
+Файл полностью самостоятельный (логика построения структуры из
+kompas_bom_structure.py включена сюда же) — это специально сделано,
+потому что встроенный Python в Компасе не всегда видит соседние .py
+файлы через обычный импорт (другая рабочая директория/__file__).
+Для ручной пост-обработки уже сохранённых файлов вне Компаса можно
+по-прежнему пользоваться отдельным kompas_bom_structure.py.
 
 ВАЖНО про надёжность:
   Точные названия свойств/методов COM-объектов и числовые коды формата
@@ -34,13 +40,163 @@
 """
 
 import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from kompas_bom_structure import build_structured_workbook
 
 
 DOCUMENT_TYPE_SPECIFICATION = 5  # ksDocumentSpecification
+
+# ---------------------------------------------------------------------------
+# Построение структурированной таблицы (та же логика, что в
+# kompas_bom_structure.py, включена сюда, чтобы макрос не зависел от
+# импорта соседнего файла внутри встроенного Python Компаса).
+# ---------------------------------------------------------------------------
+
+BOM_OUTPUT_COLUMNS = [
+    ("Уровень", "level"),
+    ("Позиция", "Позиция"),
+    ("Обозначение", "Обозначение"),
+    ("Наименование", "Наименование"),
+    ("Количество", "Количество"),
+    ("Масса", "Масса"),
+    ("Материал", "Материал"),
+    ("Раздел спецификации", "Раздел спецификации"),
+    ("Форматы листов документа", "Форматы листов документа"),
+    ("Вид изделия", "Вид изделия"),
+    ("Обозначение стандарта", "Обозначение стандарта"),
+    ("Типоразмер", "Типоразмер"),
+    ("Примечание", "Примечание"),
+]
+
+
+def _read_bom_source_rows(path):
+    """Читает исходную плоскую выгрузку (.xls или .xlsx) построчно."""
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".xls":
+        import xlrd
+        wb = xlrd.open_workbook(path)
+        sh = wb.sheet_by_index(0)
+        header = [str(sh.cell_value(0, c)).strip() for c in range(sh.ncols)]
+        rows = []
+        for r in range(1, sh.nrows):
+            values = [sh.cell_value(r, c) for c in range(sh.ncols)]
+            row = dict(zip(header, values))
+            if any(str(v).strip() for v in values):
+                rows.append(row)
+        return rows
+
+    import openpyxl
+    wb = openpyxl.load_workbook(path, data_only=True)
+    sh = wb.active
+    rows_iter = sh.iter_rows(values_only=True)
+    header = [str(v).strip() if v is not None else "" for v in next(rows_iter)]
+    rows = []
+    for values in rows_iter:
+        if values is None or all(v is None for v in values):
+            continue
+        row = dict(zip(header, values))
+        rows.append(row)
+    return rows
+
+
+def _bom_clean(value):
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _bom_level_from_n(n_value):
+    """Уровень вложенности по коду вида '1.2.3' -> 3. Пустой/битый код -> 1."""
+    text = _bom_clean(n_value)
+    if not text:
+        return 1
+    return text.count(".") + 1
+
+
+def _build_bom_tree_rows(source_rows):
+    """Дополняет строки уровнем вложенности и признаком 'это узел (есть дети)'."""
+    codes = [_bom_clean(r.get("N")) for r in source_rows]
+
+    for row, code in zip(source_rows, codes):
+        row["level"] = _bom_level_from_n(code)
+        row["_code"] = code
+        row["_is_node"] = any(
+            other and other != code and other.startswith(code + ".")
+            for other in codes
+        )
+    return source_rows
+
+
+def build_structured_workbook(source_path, output_path):
+    """Читает плоскую выгрузку Компаса и сохраняет наглядный xlsx с деревом."""
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    rows = _read_bom_source_rows(source_path)
+    rows = _build_bom_tree_rows(rows)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Состав изделия"
+
+    # Группировка строк сворачивается кнопкой над группой (родитель сверху).
+    ws.sheet_properties.outlinePr.summaryBelow = False
+    ws.sheet_properties.outlinePr.summaryRight = False
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="4472C4")
+    node_font = Font(bold=True)
+    node_fill = PatternFill("solid", fgColor="DCE6F1")
+
+    for col_idx, (title, _) in enumerate(BOM_OUTPUT_COLUMNS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=title)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    name_col_index = [
+        i for i, (_, key) in enumerate(BOM_OUTPUT_COLUMNS, start=1) if key == "Наименование"
+    ][0]
+
+    excel_row = 2
+    for row in rows:
+        level = row.get("level", 1)
+        is_node = row.get("_is_node", False)
+
+        for col_idx, (_, key) in enumerate(BOM_OUTPUT_COLUMNS, start=1):
+            if key == "level":
+                value = level
+            else:
+                value = _bom_clean(row.get(key, ""))
+                if value == "":
+                    value = None
+            cell = ws.cell(row=excel_row, column=col_idx, value=value)
+
+            if col_idx == name_col_index:
+                cell.alignment = Alignment(indent=min(level - 1, 14) * 2, vertical="center")
+            else:
+                cell.alignment = Alignment(vertical="center")
+
+            if is_node:
+                cell.font = node_font
+                cell.fill = node_fill
+
+        # Excel допускает outline_level от 0 до 7 — глубже сворачивать не даст,
+        # но отступ в названии по-прежнему покажет реальный уровень.
+        ws.row_dimensions[excel_row].outline_level = min(max(level - 1, 0), 7)
+        excel_row += 1
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = "A1:{}{}".format(get_column_letter(len(BOM_OUTPUT_COLUMNS)), excel_row - 1)
+
+    widths = [10, 10, 20, 55, 10, 10, 30, 20, 12, 20, 22, 22, 25]
+    for col_idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    wb.save(output_path)
+    return output_path
 
 
 def _log(msg):
