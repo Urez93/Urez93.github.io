@@ -49,7 +49,7 @@ CONFIG = {
 
     # Геометрия
     "tolerance": 0.02,            # точность аппроксимации кривых, мм
-    "plane_tolerance": 0.01,      # допуск на плоскостность грани, мм
+    "plane_tolerance": 0.05,      # допуск на плоскостность грани, мм
     "weld_tolerance": 0.05,       # допуск на стыковку рёбер в контур, мм
     "min_segment": 1e-4,          # короче этого сегменты выбрасываются, мм
 
@@ -1183,13 +1183,23 @@ def analyse_contours(loops):
         return None
 
     points = [point for loop in loops for point in loop]
-    plane = fit_plane(max(loops, key=len))
-    if plane is None:
+
+    # Плоскость строим по каждому контуру и берём ту, что лучше описывает
+    # грань: у почти вырожденного контура нормаль по Ньюэллу неустойчива,
+    # и по одному лишь самому длинному контуру грань можно потерять.
+    plane = None
+    residual = None
+    for loop in loops:
+        candidate = fit_plane(loop)
+        if candidate is None:
+            continue
+        error = plane_residual(points, candidate[0], candidate[1])
+        if residual is None or error < residual:
+            plane, residual = candidate, error
+
+    if plane is None or residual > CONFIG["plane_tolerance"]:
         return None
     center, normal = plane
-
-    if plane_residual(points, center, normal) > CONFIG["plane_tolerance"]:
-        return None
 
     axis_x, axis_y = plane_axes(normal)
     areas = []
@@ -1221,54 +1231,66 @@ def size_text(face):
     return "{:.1f} x {:.1f} мм".format(width, height)
 
 
-def report_candidates(planar, count=5):
+def report_candidates(planar, thickness_hint, count=6):
     """Крупнейшие плоские грани — чтобы было видно, из чего шёл выбор."""
-    log("  кандидаты (площадь, габарит, контуров):")
+    log("  кандидаты (площадь, габарит, контуров, замкнуты, обратная сторона):")
     for face in planar[:count]:
-        log("    {:>12.2f} мм2   {:>18}   {}".format(
-            face.area, size_text(face), len(face.loops)))
+        closed = all(norm(sub(loop[0], loop[-1])) <= CONFIG["weld_tolerance"]
+                     for loop in face.loops)
+        found = opposite_face(face, planar, thickness_hint)
+        pair = "{:.2f} мм".format(found[1]) if found else "нет"
+        log("    {:>12.2f} мм2 {:>18} {:>3} {:>8} {:>10}".format(
+            face.area, size_text(face), len(face.loops),
+            "да" if closed else "НЕТ", pair))
+
+
+def opposite_face(face, planar, thickness_hint):
+    """
+    Грань с обратной стороны листа: параллельная данной и отстоящая от неё
+    на толщину материала. Площади сторон при этом сравнивать нельзя — фаска,
+    карман или разрезанная на части грань делают их разными.
+    """
+    best = None
+    best_error = None
+    for other in planar:
+        if other is face:
+            continue
+        if abs(abs(dot(other.normal, face.normal)) - 1.0) > 1e-3:
+            continue
+        distance = abs(dot(sub(other.origin, face.origin), face.normal))
+        if distance < 1e-6:
+            continue  # грань в той же плоскости — это не обратная сторона
+        if thickness_hint is None:
+            # Толщина неизвестна (не листовая деталь) — ближайшая
+            # параллельная грань и есть обратная сторона.
+            error = distance
+        else:
+            allowed = max(thickness_hint * 0.1, 0.1)
+            error = abs(distance - thickness_hint)
+            if error > allowed:
+                continue
+        if best_error is None or error < best_error:
+            best, best_error = (other, distance), error
+    return best
 
 
 def choose_plate_face(planar, thickness_hint):
     """
-    Выбирает грань развёртки.
+    Выбирает грань развёртки: наибольшую из тех, что лежат на стороне листа.
 
-    Наибольшая площадь — ненадёжный признак: грань сгиба или боковина, у
-    которой рёбра прочитаны только по концам, выглядит плоским
-    четырёхугольником и может оказаться крупнее настоящей развёртки.
-    Признак листа надёжнее: две параллельные грани одинаковой площади,
-    разнесённые ровно на толщину материала.
+    Главный критерий — площадь. Наличие параллельной грани на расстоянии
+    толщины материала используется только как проверка, что грань
+    действительно сторона листа, а не грань сгиба или боковина, у которой
+    рёбра прочитались лишь по концевым точкам.
     """
-    best_pair = None
-    best_area = 0.0
+    for face in planar:  # отсортированы по убыванию площади
+        found = opposite_face(face, planar, thickness_hint)
+        if found is not None:
+            other, distance = found
+            ok("грань выбрана: наибольшая из сторон листа")
+            return face, other, distance
 
-    for index, first in enumerate(planar):
-        for second in planar[index + 1:]:
-            if abs(abs(dot(first.normal, second.normal)) - 1.0) > 1e-3:
-                continue
-            distance = abs(dot(sub(second.origin, first.origin), first.normal))
-            if distance < 1e-6:
-                continue  # грани в одной плоскости — это не лист
-            if thickness_hint is not None:
-                allowed = max(thickness_hint * 0.05, 0.05)
-                if abs(distance - thickness_hint) > allowed:
-                    continue
-            smaller = min(first.area, second.area)
-            larger = max(first.area, second.area)
-            if smaller < larger * 0.9:
-                continue
-            if larger > best_area:
-                best_area = larger
-                best_pair = (first, second, distance)
-
-    if best_pair is not None:
-        first, second, distance = best_pair
-        face = first if first.area >= second.area else second
-        other = second if face is first else first
-        ok("грань выбрана по паре сторон листа")
-        return face, other, distance
-
-    warn("пара сторон листа не найдена — берём наибольшую плоскую грань.")
+    warn("грань с обратной стороной листа не найдена — берём наибольшую.")
     return planar[0], None, None
 
 
@@ -1310,7 +1332,7 @@ def find_plate_faces(faces, thickness_hint=None):
         return None, None, None
 
     planar.sort(key=lambda item: item.area, reverse=True)
-    report_candidates(planar)
+    report_candidates(planar, thickness_hint)
 
     best, opposite, thickness = choose_plate_face(planar, thickness_hint)
     if best is None:
