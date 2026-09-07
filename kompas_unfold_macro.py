@@ -551,22 +551,7 @@ def ensure_unfolded(part):
     Переводит листовую деталь в развёрнутое состояние.
     Возвращает (получилось_ли, функция_восстановления).
     """
-    step("Тип детали")
-
-    if not is_sheet_metal(part):
-        ok("деталь твердотельная — работаем как с плоской пластиной")
-        return True, None
-
-    ok("деталь листовая")
-
-    # Листовое тело без гибов — это та же плоская заготовка. Разворачивать
-    # нечего, поэтому модель не трогаем: контур снимается как есть.
-    bends, details = count_bends(part)
-    if bends == 0:
-        ok("гибов нет — развёртка не требуется, деталь плоская")
-        return True, None
-    ok("гибов: {} ({})".format(
-        bends, ", ".join("{}: {}".format(name, count) for name, count in details)))
+    step("Развёртка в модели")
 
     if not CONFIG["unfold_sheet_metal"]:
         warn("автоматическая развёртка отключена в CONFIG")
@@ -875,6 +860,12 @@ def api5_part():
     return _API5["part"]
 
 
+def reset_api5():
+    """Сбрасывает кеш API5: после перестроения модели геометрию читаем заново."""
+    _API5["part"] = None
+    _API5["tried"] = False
+
+
 def looks_like_face(definition):
     """Похож ли объект на определение грани: у грани есть рёбра или циклы."""
     if definition is None:
@@ -926,6 +917,41 @@ def collect_faces(bodies):
     if faces:
         return faces
     return api5_faces()
+
+
+class EdgeChain(list):
+    """Ломаная ребра, помнящая тип кривой, заявленный моделью."""
+
+    def __init__(self, points, kind=None):
+        list.__init__(self, points)
+        self.kind = kind
+
+
+def flip(chain):
+    """Развернуть ломаную, сохранив тип кривой."""
+    return EdgeChain(reversed(chain), getattr(chain, "kind", None))
+
+
+def edge_kind(edge):
+    """
+    Тип кривой ребра по данным модели: circle, arc, line или None.
+
+    Спрашивать модель точнее, чем распознавать геометрию по точкам:
+    окружность останется окружностью независимо от радиуса и плотности
+    выборки, а отрезок — отрезком.
+    """
+    for name, kind in (("IsCircle", "circle"),
+                       ("IsArc", "arc"),
+                       ("IsLineSeg", "line"),
+                       ("IsStraight", "line")):
+        try:
+            value = getattr(edge, name)
+            result = value() if callable(value) else value
+        except Exception:
+            continue
+        if result:
+            return kind
+    return None
 
 
 def face_edges(face):
@@ -999,6 +1025,16 @@ def curve_ranges(curve):
     подстановки проверяем по концам ребра.
     """
     ranges = []
+    # У ksCurve3D диапазон задан парой методов — это точное значение,
+    # остальные варианты ниже остаются на случай другой сборки.
+    try:
+        first = curve.GetParamMin()
+        last = curve.GetParamMax()
+        if isinstance(first, (int, float)) and isinstance(last, (int, float)):
+            ranges.append((float(first), float(last)))
+    except Exception:
+        pass
+
     for name in ("GetParamRange", "ParamRange", "GetParamsRange"):
         try:
             raw = getattr(curve, name)
@@ -1163,14 +1199,17 @@ def edge_polyline(edge, samples=None):
     """
     if samples is None:
         samples = CONFIG["curve_samples"]
+    kind = edge_kind(edge)
     ends = edge_vertices(edge)
     points = curve_points(curve_of(edge), samples, ends)
     if points:
         STATS["curve"] += 1
-        return dedupe(points)
+        STATS.setdefault(kind or "free", 0)
+        STATS[kind or "free"] += 1
+        return EdgeChain(dedupe(points), kind)
     if ends:
         STATS["ends"] += 1
-        return dedupe(ends)
+        return EdgeChain(dedupe(ends), kind or "line")
     STATS["failed"] += 1
     return None
 
@@ -1268,11 +1307,11 @@ def chain_edges(polylines):
                 if norm(sub(tail, chain[0])) <= tolerance:
                     loop.append(chain)
                 elif norm(sub(tail, chain[-1])) <= tolerance:
-                    loop.append(list(reversed(chain)))
+                    loop.append(flip(chain))
                 elif norm(sub(head, chain[-1])) <= tolerance:
                     loop.insert(0, chain)
                 elif norm(sub(head, chain[0])) <= tolerance:
-                    loop.insert(0, list(reversed(chain)))
+                    loop.insert(0, flip(chain))
                 else:
                     continue
                 pending.pop(index)
@@ -1649,7 +1688,8 @@ def find_plate_faces(faces, thickness_hint=None):
     """
     step("Поиск грани развёртки")
 
-    STATS.update({"curve": 0, "ends": 0, "failed": 0, "located": 0})
+    STATS.update({"curve": 0, "ends": 0, "failed": 0, "located": 0,
+                  "line": 0, "arc": 0, "circle": 0, "free": 0})
     planar = []
     all_points = []
     for face in faces:
@@ -1676,6 +1716,9 @@ def find_plate_faces(faces, thickness_hint=None):
     log("  рёбра: по кривой {}, по концам {}, не прочитано {}"
         " (диапазон подобран у {})".format(
             STATS["curve"], STATS["ends"], STATS["failed"], STATS["located"]))
+    log("  типы кривых из модели: отрезков {}, дуг {}, окружностей {},"
+        " прочих {}".format(STATS["line"], STATS["arc"], STATS["circle"],
+                            STATS["free"]))
     if STATS["ends"] > STATS["curve"]:
         warn("большинство рёбер прочитано только по концам — дуги будут спрямлены.")
     if not planar:
@@ -1749,8 +1792,9 @@ def flatten(face, extra=None):
         # а до него прореживание испортило бы дуги.
         result = []
         for chain in chains:
-            flat = [project(point, face.origin, axis_x, axis_y)
-                    for point in chain]
+            flat = EdgeChain([project(point, face.origin, axis_x, axis_y)
+                              for point in chain],
+                             getattr(chain, "kind", None))
             if len(flat) >= 2:
                 result.append(flat)
         return result
@@ -1764,7 +1808,8 @@ def flatten(face, extra=None):
         points = [point for loop in chunks for chain in loop for point in chain]
         min_x = min(x for x, _ in points)
         min_y = min(y for _, y in points)
-        move = lambda chain: [(x - min_x, y - min_y) for x, y in chain]
+        move = lambda chain: EdgeChain([(x - min_x, y - min_y) for x, y in chain],
+                                       getattr(chain, "kind", None))
         chunks = [[move(chain) for chain in loop] for loop in chunks]
         extras = [move(chain) for chain in extras]
 
@@ -2180,13 +2225,45 @@ def fmt(value):
     return "{:.6f}".format(float(value))
 
 
+def chain_primitives(chain):
+    """
+    Примитивы одного ребра.
+
+    Если модель назвала тип кривой — строим по нему: отрезок по концам,
+    окружность и дуга по трём точкам самой кривой. Это точно и не зависит
+    ни от радиуса, ни от плотности выборки. Для сплайнов и неизвестных
+    типов остаётся разбор по геометрии.
+    """
+    kind = getattr(chain, "kind", None)
+    if kind == "line" and len(chain) >= 2:
+        return [("line", chain[0], chain[-1])]
+
+    if kind == "circle" and len(chain) >= 4:
+        # У замкнутой кривой концы совпадают, поэтому берём точки,
+        # разнесённые по всей окружности: иначе построение вырождается.
+        count = len(chain)
+        fitted = circle_through(chain[0], chain[count // 3], chain[2 * count // 3])
+        if fitted is not None:
+            return [("circle", fitted[0], fitted[1])]
+
+    if kind == "arc" and len(chain) >= 3:
+        middle = chain[len(chain) // 2]
+        fitted = circle_through(chain[0], middle, chain[-1])
+        if fitted is not None:
+            centre, radius = fitted
+            first, last = arc_angles(centre, chain[0], chain[-1], middle)
+            return [("arc", centre, radius, first, last)]
+
+    return contour_segments(chain, False)
+
+
 def loop_primitives(loop, chunks, closed):
     """
     Примитивы контура.
 
-    Целая окружность распознаётся по контуру целиком — отверстие в модели
-    часто состоит из двух полуокружностей. Всё остальное разбирается по
-    рёбрам: одно ребро — одна кривая, и разбор не залезает на соседнее.
+    Замкнутое отверстие часто состоит из двух полуокружностей, поэтому
+    сначала пробуем описать контур целиком одной окружностью. Дальше —
+    по рёбрам: одно ребро есть одна кривая, и разбор не залезает на соседнее.
     """
     whole = contour_segments(loop, closed)
     if len(whole) == 1 and whole[0][0] == "circle":
@@ -2194,7 +2271,7 @@ def loop_primitives(loop, chunks, closed):
 
     primitives = []
     for chain in chunks:
-        primitives.extend(contour_segments(chain, False))
+        primitives.extend(chain_primitives(chain))
     return primitives or whole
 
 
@@ -2394,6 +2471,29 @@ def sheet_thickness(part):
     return None
 
 
+def describe_part(part):
+    """Сообщает тип детали и её листовые параметры."""
+    step("Тип детали")
+    if is_sheet_metal(part):
+        thickness = sheet_thickness(part)
+        ok("деталь листовая, толщина {}".format(
+            "{:.2f} мм".format(thickness) if thickness else "не определена"))
+        count, details = count_bends(part)
+        if details:
+            ok("операции гиба: {}".format(", ".join(
+                "{}: {}".format(name, number) for name, number in details)))
+    else:
+        ok("деталь твердотельная — работаем как с плоской пластиной")
+
+
+def is_flat(part, thickness, extent):
+    """Плоская ли заготовка: габарит поперёк грани равен толщине листа."""
+    reference = sheet_thickness(part) or thickness
+    if reference is None or extent is None:
+        return True
+    return extent <= reference * 1.5 + 0.5
+
+
 def check_flat(part, thickness, extent):
     """
     Проверяет, что деталь действительно плоская заготовка.
@@ -2407,23 +2507,29 @@ def check_flat(part, thickness, extent):
         warn("толщину определить не удалось — проверка на плоскостность пропущена.")
         return True
 
-    limit = reference * 1.5 + 0.5
-    if extent <= limit:
+    if is_flat(part, thickness, extent):
         return True
 
     err("деталь не плоская: габарит поперёк грани {:.2f} мм при толщине {:.2f} мм."
         .format(extent, reference))
-    bends = count_bends(part)[0] if part is not None else 0
-    if bends:
-        log("    Разверните листовое тело (Листовое тело -> Развернуть)")
-        log("    и запустите макрос снова.")
-    elif is_sheet_metal(part):
-        log("    Гибов в детали нет, но она не плоская: похоже, объём даёт")
-        log("    штамповка (жалюзи, буртик, рифт). Развернуть её нельзя.")
+    if is_sheet_metal(part):
+        log("    Развернуть деталь не удалось. Проверьте параметры развёртки")
+        log("    (Листовое тело -> Параметры развёртки, неподвижная грань);")
+        log("    объём могла дать и штамповка — жалюзи, буртик, рифт, —")
+        log("    такую деталь развернуть нельзя.")
     else:
         log("    Развёртка возможна только для листового тела. Преобразуйте")
         log("    деталь командой 'Распознать листовое тело' и повторите.")
     return False
+
+
+def read_plate(part):
+    """Читает геометрию детали и выбирает сторону листа."""
+    faces = collect_faces(get_bodies(part))
+    if not faces:
+        err("не удалось получить грани детали.")
+        return None, None, None, []
+    return find_plate_faces(faces, sheet_thickness(part))
 
 
 def export_active_part(application):
@@ -2431,23 +2537,32 @@ def export_active_part(application):
     if part is None:
         return False
 
-    unfolded, restore = ensure_unfolded(part)
+    describe_part(part)
+    restore = None
     try:
-        if not unfolded:
-            return False
-
-        faces = collect_faces(get_bodies(part))
-        if not faces:
-            err("не удалось получить грани детали.")
-            return False
-
-        face, thickness, extent, bends = find_plate_faces(
-            faces, sheet_thickness(part))
+        face, thickness, extent, bends = read_plate(part)
         if face is None:
             return False
 
-        if not check_flat(part, thickness, extent):
-            return False
+        # Разворачивать или нет — решает геометрия, а не список операций:
+        # у листового тела по разомкнутому эскизу гибы принадлежат самой
+        # операции, отдельных операций сгиба в модели нет.
+        if not is_flat(part, thickness, extent):
+            if not is_sheet_metal(part):
+                check_flat(part, thickness, extent)
+                return False
+
+            ok("деталь не плоская — разворачиваем листовое тело")
+            unfolded, restore = ensure_unfolded(part)
+            if not unfolded:
+                return False
+
+            reset_api5()
+            face, thickness, extent, bends = read_plate(part)
+            if face is None:
+                return False
+            if not check_flat(part, thickness, extent):
+                return False
 
         loops, chunks, bend_lines = flatten(face, bends)
         if not loops:
