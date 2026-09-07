@@ -181,27 +181,71 @@ def connect_kompas():
     # 2. Внешнее COM-подключение
     try:
         import pythoncom
-        from win32com.client import Dispatch, gencache
+        from win32com.client import gencache
     except ImportError:
         err("не установлен пакет pywin32 (win32com).")
         log("    Установка:  pip install pywin32")
         return None, None
 
-    try:
-        module7 = gencache.EnsureModule(API7_GUID, 0, 1, 0)
-        dispatch = Dispatch("Kompas.Application.7")
-        application = module7.IApplication(
-            dispatch._oleobj_.QueryInterface(
-                module7.IApplication.CLSID, pythoncom.IID_IDispatch
-            )
-        )
-        ok("подключение к API7 установлено")
-        return application, module7
-    except Exception as exc:
-        err("не удалось подключиться: {}".format(exc))
+    raw, running = connect_object("Kompas.Application.7")
+    if raw is None:
+        err("не удалось подключиться к КОМПАС-3D.")
         log("    Проверьте, что КОМПАС-3D запущен и разрядность Python")
         log("    совпадает с разрядностью КОМПАСа (обычно 64 бита).")
         return None, None
+
+    try:
+        module7 = gencache.EnsureModule(API7_GUID, 0, 1, 0)
+        application = module7.IApplication(
+            raw._oleobj_.QueryInterface(
+                module7.IApplication.CLSID, pythoncom.IID_IDispatch
+            )
+        )
+    except Exception as exc:
+        err("не удалось получить интерфейс API7: {}".format(exc))
+        return None, None
+
+    if running:
+        ok("подключение к работающей копии КОМПАС-3D установлено")
+    else:
+        warn("работающая копия КОМПАСа не найдена — запущена НОВАЯ, пустая.")
+        report_wrong_instance()
+    return application, module7
+
+
+def connect_object(prog_id):
+    """
+    Подключение к УЖЕ запущенной копии КОМПАСа.
+
+    Возвращает (объект, была_ли_запущена). Обычный Dispatch при отсутствии
+    копии в таблице выполняющихся объектов молча стартует новую — пустую,
+    невидимую, и все дальнейшие ошибки выглядят загадочно. Поэтому сначала
+    GetActiveObject, и только потом, как запасной путь, Dispatch.
+    """
+    try:
+        from win32com.client import Dispatch, GetActiveObject
+    except ImportError:
+        return None, False
+
+    try:
+        return GetActiveObject(prog_id), True
+    except Exception:
+        pass
+    try:
+        return Dispatch(prog_id), False
+    except Exception:
+        return None, False
+
+
+def report_wrong_instance():
+    """Почему макрос мог попасть не в ту копию КОМПАСа."""
+    log("    Макрос работает не с вашим окном КОМПАСа, поэтому документов")
+    log("    и не видит. Возможные причины:")
+    log("      - КОМПАС и Python запущены с разными правами (один от")
+    log("        администратора, другой нет) — они друг друга не видят;")
+    log("      - открыто несколько копий КОМПАСа, деталь в другой;")
+    log("      - КОМПАС ещё не закончил запуск.")
+    log("    Проверьте диспетчер задач: лишний процесс КОМПАСа надо закрыть.")
 
 
 # ============================================================
@@ -349,8 +393,18 @@ def get_active_part(application):
 
     document = value_of(application, ["ActiveDocument"])
     if document is None:
-        err("в КОМПАС-3D нет открытых документов.")
-        return None, None, None
+        # Активного документа нет, но открытые могут быть: например, фокус
+        # в КОМПАСе стоит не на окне документа.
+        opened = as_list(value_of(application, ["Documents"]))
+        if opened:
+            warn("активный документ не определён, беру первый из открытых.")
+            document = opened[0]
+        else:
+            err("в этой копии КОМПАС-3D нет открытых документов.")
+            log("    Видимость окна КОМПАСа: {}".format(
+                value_of(application, ["Visible"])))
+            report_wrong_instance()
+            return None, None, None
 
     path = value_of(document, ["PathName", "Path", "Name"], "")
     if not path or not os.path.isabs(path):
@@ -801,14 +855,15 @@ def api5_part():
 
     try:
         import pythoncom
-        from win32com.client import Dispatch, gencache
+        from win32com.client import gencache
     except ImportError:
         return None
 
     try:
         module5 = gencache.EnsureModule(API5_GUID, 0, 1, 0)
+        raw, _ = connect_object("Kompas.Application.5")
         kompas5 = module5.KompasObject(
-            Dispatch("Kompas.Application.5")._oleobj_.QueryInterface(
+            raw._oleobj_.QueryInterface(
                 module5.KompasObject.CLSID, pythoncom.IID_IDispatch
             )
         )
