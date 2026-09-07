@@ -1,107 +1,60 @@
 # -*- coding: utf-8 -*-
 """
-Разведочный скрипт v2: НИЧЕГО не сохраняет и не изменяет.
+Разведочный скрипт v4: НИЧЕГО не сохраняет и не изменяет.
 
-Первая разведка показала, что в объектах IKompasDocument/IPart7 (API7)
-нет метода, похожего на команду меню "Управление -> Отчёты -> Создать
-отчёт" — похоже, это чисто UI-команда без прямого COM-метода. Но она же
-показала, что dir() ненадёжен: например, doc.PathName прекрасно
-работает, хотя в dir(doc) его не было. Значит для реальных свойств
-нужно не смотреть dir(), а пробовать их вызвать напрямую (getattr) —
-COM в pywin32 обычно позволяет обращаться и к тому, что не попало в
-статически сгенерированный список.
+Задача: найти, откуда панель "Свойства" в Компасе (со "Списком свойств":
+Обозначение/Наименование/Количество/Материал/Масса/Позиция/Раздел
+спецификации/Форматы листов/Примечание) берёт значение "Раздел
+спецификации" для детали — и получить это же значение из Python.
 
-Зато у IPart7 есть настоящий метод PartsEx — это прямой доступ к
-дочерним деталям/подсборкам верхней детали. План: вместо экспорта
-спецификации/отчёта строить структуру состава изделия напрямую обходом
-дерева сборки через PartsEx — так вообще не нужен ни файл
-спецификации, ни команда "Создать отчёт".
+6 прямых свойств IPart7 (SpecSectionType/SectionType/...) не сработали.
+Скорее всего эти данные лежат в отдельном связанном объекте — что-то
+вроде "Article" (изделие/статья спецификации) — а не прямо на IPart7.
+Пробуем несколько вероятных названий такого объекта и, если найдём,
+смотрим его реальные члены через dir() и пробуем достать значение по
+нескольким вероятным именам параметра.
 
-Этот скрипт проверяет:
-  - как из PartsEx получить список дочерних деталей (Count/Item и т.п.);
-  - какие у детали реально работают свойства: Name, обозначение
-    (Marking/Designation/...), количество экземпляров, материал;
-  - работает ли то же самое рекурсивно на дочерней детали (есть ли у
-    неё тоже PartsEx, то есть можно ли идти вглубь).
-
-Запустите на той же сборке верхнего уровня, что и раньше, и пришлите
-весь вывод.
+Запустите на детали, у которой вы точно видели "Раздел спецификации" =
+"Стандартные изделия" в панели свойств (например, тот самый болт с
+скриншота), и пришлите весь вывод.
 """
 
 import win32com.client
 
 
-def _try_attrs(obj, names, label):
-    print("  Проверяем атрибуты объекта [{}]:".format(label))
-    found = {}
-    for name in names:
-        try:
-            value = getattr(obj, name)
-            # Если это метод/COM-объект, а не простое значение — не печатаем целиком.
-            printable = value
-            if callable(value):
-                printable = "<callable>"
-            print("    ✓ {} = {!r}".format(name, printable))
-            found[name] = value
-        except Exception as e:
-            print("    ✗ {} недоступен: {}".format(name, e))
-    return found
-
-
-def _try_collection_access(obj, label):
-    print("  Пробуем получить количество элементов и первый элемент [{}]:".format(label))
-
-    if isinstance(obj, (list, tuple)):
-        print("    Результат — обычный Python {} длиной {}".format(type(obj).__name__, len(obj)))
-        first = obj[0] if obj else None
-        if first is not None:
-            print("    Первый элемент, тип: {}".format(type(first)))
-        return len(obj), first
-
-    count = None
-    for name in ("Count", "GetCount", "Length"):
-        try:
-            value = getattr(obj, name)
-            count = value() if callable(value) else value
-            print("    ✓ {} -> {}".format(name, count))
-            break
-        except Exception as e:
-            print("    ✗ {} недоступен: {}".format(name, e))
-
-    first_item = None
-    if count:
-        for name in ("Item", "GetItem", "GetPart"):
-            try:
-                method = getattr(obj, name)
-                first_item = method(0)
-                print("    ✓ {}(0) -> {}".format(name, type(first_item)))
-                break
-            except Exception as e:
-                print("    ✗ {}(0) недоступен: {}".format(name, e))
-
+def _print_members(title, obj):
+    print()
+    print("-" * 70)
+    print(title)
+    print("-" * 70)
+    if obj is None:
+        print("  (объект отсутствует)")
+        return
+    print("  Python-тип объекта:", type(obj))
     try:
-        print("    Пробуем for-итерацию по объекту напрямую...")
-        items = list(obj)
-        print("    ✓ Итерация сработала, элементов: {}".format(len(items)))
-        if items and first_item is None:
-            first_item = items[0]
+        members = [m for m in dir(obj) if not m.startswith("_")]
     except Exception as e:
-        print("    ✗ Итерация не сработала: {}".format(e))
+        print("  dir() не сработал:", e)
+        return
+    print("  Члены ({}):".format(len(members)))
+    for m in sorted(members):
+        print("    ", m)
 
-    return count, first_item
 
-
-CANDIDATE_NAMES = [
-    "Name", "Marking", "Designation", "Symbol", "FullMarking",
-    "Material", "MaterialName",
-    "Count", "InstanceCount", "UniqueNum",
-    "Comment", "Note",
-]
+def _try_get(obj, name, *args):
+    try:
+        attr = getattr(obj, name)
+        result = attr(*args) if callable(attr) else attr
+        print("    ✓ {}{} -> {!r}".format(name, args, result))
+        return result
+    except Exception as e:
+        print("    ✗ {}{} недоступен: {}".format(name, args, e))
+        return None
 
 
 def main():
     print("=" * 70)
-    print("РАЗВЕДКА API КОМПАСА v2 — структура сборки через PartsEx")
+    print("РАЗВЕДКА API КОМПАСА v4 — источник 'Раздел спецификации'")
     print("=" * 70)
 
     app = win32com.client.Dispatch("Kompas.Application.7")
@@ -110,79 +63,64 @@ def main():
 
     doc3d = win32com.client.CastTo(doc, "IKompasDocument3D")
     top_part = doc3d.TopPart
-    print()
-    print("TopPart получен:", type(top_part))
 
+    # Найдём деталь, у которой заведомо есть "Раздел спецификации" —
+    # пользователь запускает скрипт на выделенной детали или на
+    # top_part напрямую (если top_part сам такая деталь). Дальше
+    # достаточно первого прямого потомка, если у top_part'а самого
+    # свойство пустое — просто для проверки механизма доступа.
+    target = top_part
     print()
-    _try_attrs(top_part, CANDIDATE_NAMES, "TopPart")
+    print("Целевая деталь (TopPart):", getattr(target, "Name", "?"), "/", getattr(target, "Marking", "?"))
 
     print()
     print("-" * 70)
-    print("top_part.PartsEx — это МЕТОД (нужны аргументы), пробуем разные сигнатуры")
+    print("Пробуем найти связанный объект-контейнер свойств спецификации")
     print("-" * 70)
-
-    call_attempts = [
-        ("PartsEx()", lambda: top_part.PartsEx()),
-        ("PartsEx(True)", lambda: top_part.PartsEx(True)),
-        ("PartsEx(False)", lambda: top_part.PartsEx(False)),
-        ("PartsEx(True, True)", lambda: top_part.PartsEx(True, True)),
-        ("PartsEx(False, False)", lambda: top_part.PartsEx(False, False)),
-        ("PartsEx(True, False)", lambda: top_part.PartsEx(True, False)),
-        ("PartsEx(False, True)", lambda: top_part.PartsEx(False, True)),
-        ("PartsEx(0)", lambda: top_part.PartsEx(0)),
-        ("PartsEx(1)", lambda: top_part.PartsEx(1)),
-    ]
-
-    parts_ex = None
-    for name, action in call_attempts:
+    container = None
+    for attr_name in ("Article", "SpecificationInfo", "PropertyMng", "Properties",
+                       "AttributeMng", "SpecArticle", "SpcArticle", "BomInfo"):
         try:
-            result = action()
-            print("  ✓ {} сработал, тип результата: {}, значение (если короткое): {!r}".format(
-                name, type(result), result if not hasattr(result, "__len__") or len(str(result)) < 200 else "<длинное>"
-            ))
-            if result:
-                parts_ex = result
-                print("    -> будем использовать этот результат для дальнейшего разбора")
+            value = getattr(target, attr_name)
+            result = value() if callable(value) else value
+            if result is not None:
+                print("  ✓ target.{} -> {}".format(attr_name, type(result)))
+                container = (attr_name, result)
                 break
+            else:
+                print("  ✗ target.{} вернул None".format(attr_name))
         except Exception as e:
-            print("  ✗ {} не сработал: {}".format(name, e))
+            print("  ✗ target.{} недоступен: {}".format(attr_name, e))
 
-    try:
-        if parts_ex is not None:
-            print()
-            print("Тип parts_ex:", type(parts_ex))
-        count, first_child = _try_collection_access(parts_ex, "PartsEx(...)") if parts_ex is not None else (None, None)
+    if container:
+        _print_members("Объект '{}'".format(container[0]), container[1])
 
-        if first_child is not None:
-            print()
-            print("-" * 70)
-            print("ПЕРВАЯ ДОЧЕРНЯЯ ДЕТАЛЬ/ПОДСБОРКА")
-            print("-" * 70)
-            print("Тип:", type(first_child))
-            _try_attrs(first_child, CANDIDATE_NAMES, "первый child")
+        obj = container[1]
+        print()
+        print("-" * 70)
+        print("Пробуем получить значение параметра 'Раздел спецификации' из найденного объекта")
+        print("-" * 70)
+        for method_name in ("GetParamValue", "GetValue", "GetParameterValue", "Value", "get_Value"):
+            _try_get(obj, method_name, "Раздел спецификации")
+            _try_get(obj, method_name, "SpecSection")
+            _try_get(obj, method_name, "SectionName")
+    else:
+        print()
+        print("  Ни один из вероятных контейнеров не найден на самой детали.")
 
-            print()
-            print("  Проверяем, есть ли у дочерней детали свой PartsEx (можно ли идти глубже)...")
-            child_parts_ex = None
-            for name, action in (
-                ("child.PartsEx()", lambda: first_child.PartsEx()),
-                ("child.PartsEx(True)", lambda: first_child.PartsEx(True)),
-                ("child.PartsEx(True, True)", lambda: first_child.PartsEx(True, True)),
-            ):
-                try:
-                    child_parts_ex = action()
-                    print("    ✓ {} сработал, тип: {}".format(name, type(child_parts_ex)))
-                    break
-                except Exception as e:
-                    print("    ✗ {} не сработал: {}".format(name, e))
-            if child_parts_ex is not None:
-                _try_collection_access(child_parts_ex, "child.PartsEx(...)")
-        else:
-            print("Не удалось получить первый дочерний элемент — сборка либо пуста, "
-                  "либо нужен другой способ доступа (пришлите этот вывод).")
-
-    except Exception as e:
-        print("top_part.PartsEx недоступен:", e)
+    # На случай, если это не деталь, а СПЕЦИФИКАЦИЯ-ФРАГМЕНТ на уровне
+    # документа: проверим и app.ActiveDocument напрямую теми же именами.
+    print()
+    print("-" * 70)
+    print("То же самое, но на активном документе (doc), а не на детали")
+    print("-" * 70)
+    for attr_name in ("Article", "SpecificationInfo", "PropertyMng", "Properties", "AttributeMng"):
+        try:
+            value = getattr(doc, attr_name)
+            result = value() if callable(value) else value
+            print("  {} doc.{} -> {}".format("✓" if result is not None else "✗(None)", attr_name, type(result) if result is not None else ""))
+        except Exception as e:
+            print("  ✗ doc.{} недоступен: {}".format(attr_name, e))
 
     print()
     print("=" * 70)
