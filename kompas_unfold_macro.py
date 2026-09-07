@@ -187,54 +187,65 @@ def connect_kompas():
         log("    Установка:  pip install pywin32")
         return None, None
 
-    raw, running = connect_object("Kompas.Application.7")
-    if raw is None:
-        err("не удалось подключиться к КОМПАС-3D.")
-        log("    Проверьте, что КОМПАС-3D запущен и разрядность Python")
-        log("    совпадает с разрядностью КОМПАСа (обычно 64 бита).")
-        return None, None
-
     try:
         module7 = gencache.EnsureModule(API7_GUID, 0, 1, 0)
-        application = module7.IApplication(
+    except Exception as exc:
+        err("не удалось загрузить библиотеку API7: {}".format(exc))
+        return None, None
+
+    def to_application(raw):
+        return module7.IApplication(
             raw._oleobj_.QueryInterface(
                 module7.IApplication.CLSID, pythoncom.IID_IDispatch
             )
         )
-    except Exception as exc:
-        err("не удалось получить интерфейс API7: {}".format(exc))
+
+    application, running, problem = connect_object(
+        "Kompas.Application.7", to_application)
+    if application is None:
+        err("не удалось подключиться к КОМПАС-3D: {}".format(problem))
+        log("    Проверьте, что КОМПАС-3D запущен и разрядность Python")
+        log("    совпадает с разрядностью КОМПАСа (обычно 64 бита).")
         return None, None
 
     if running:
         ok("подключение к работающей копии КОМПАС-3D установлено")
     else:
-        warn("работающая копия КОМПАСа не найдена — запущена НОВАЯ, пустая.")
-        report_wrong_instance()
+        ok("подключение к API7 установлено")
     return application, module7
 
 
-def connect_object(prog_id):
+def connect_object(prog_id, factory):
     """
-    Подключение к УЖЕ запущенной копии КОМПАСа.
+    Подключение к КОМПАСу с приведением к нужному интерфейсу.
 
-    Возвращает (объект, была_ли_запущена). Обычный Dispatch при отсутствии
-    копии в таблице выполняющихся объектов молча стартует новую — пустую,
-    невидимую, и все дальнейшие ошибки выглядят загадочно. Поэтому сначала
-    GetActiveObject, и только потом, как запасной путь, Dispatch.
+    Возвращает (объект, из_работающей_копии, описание_ошибки).
+
+    Способа два, и ни один не универсален. GetActiveObject берёт УЖЕ
+    запущенную копию — это правильно, потому что Dispatch при отсутствии
+    копии в таблице выполняющихся объектов молча стартует новую, пустую и
+    невидимую. Но зарегистрирован там бывает объект, не поддерживающий
+    нужный интерфейс, и приведение падает с "интерфейс не поддерживается".
+    Поэтому пробуем оба способа по очереди и берём тот, что дал рабочий
+    объект.
     """
     try:
         from win32com.client import Dispatch, GetActiveObject
     except ImportError:
-        return None, False
+        return None, False, "не установлен pywin32"
 
-    try:
-        return GetActiveObject(prog_id), True
-    except Exception:
-        pass
-    try:
-        return Dispatch(prog_id), False
-    except Exception:
-        return None, False
+    problem = "КОМПАС-3D не отвечает"
+    for getter, running in ((GetActiveObject, True), (Dispatch, False)):
+        try:
+            raw = getter(prog_id)
+        except Exception as exc:
+            problem = str(exc)
+            continue
+        try:
+            return factory(raw), running, None
+        except Exception as exc:
+            problem = str(exc)
+    return None, False, problem
 
 
 def report_wrong_instance():
@@ -846,12 +857,18 @@ def api5_part():
 
     try:
         module5 = gencache.EnsureModule(API5_GUID, 0, 1, 0)
-        raw, _ = connect_object("Kompas.Application.5")
-        kompas5 = module5.KompasObject(
-            raw._oleobj_.QueryInterface(
-                module5.KompasObject.CLSID, pythoncom.IID_IDispatch
+
+        def to_kompas5(raw):
+            return module5.KompasObject(
+                raw._oleobj_.QueryInterface(
+                    module5.KompasObject.CLSID, pythoncom.IID_IDispatch
+                )
             )
-        )
+
+        kompas5, _, problem = connect_object("Kompas.Application.5", to_kompas5)
+        if kompas5 is None:
+            warn("API5 недоступно: {}".format(problem))
+            return None
         document = kompas5.ActiveDocument3D()
         _API5["part"] = document.GetPart(TOP_PART) if document else None
     except Exception as exc:
